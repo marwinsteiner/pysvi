@@ -158,3 +158,51 @@ class SVI(Parametrization):
             params: Dict[str, float]
     ) -> NDArray[np.float64]:
         return svi_total_variance(k, **params)
+
+
+class SSVI(Parametrization):
+    """SSVI parametrization."""
+
+    def calibrate(
+            self,
+            k: NDArray[np.float64],
+            w_target: NDArray[np.float64],
+            **kwargs
+    ) -> Optional[Dict[str, float]]:
+        theta = kwargs["theta"]
+        from scipy.optimize import minimize
+
+        def objective(params):
+            rho, eta = params
+            penalty = 0.0
+            if abs(rho) >= 0.999: penalty += 1e6 * (abs(rho) - 0.999) ** 2
+            if eta <= 0: penalty += 1e6 * (1 - eta) ** 2
+            phi_theta = eta / np.sqrt(theta)
+            w_model = ssvi_total_variance(k, theta, rho, phi_theta)
+            mse = float(np.mean((w_target - w_model) ** 2))
+            return mse + penalty
+
+        x0 = np.array([0.0, 1.0])
+        bounds = [(-0.999, 0.999), (1e-8, None)]
+
+        res = minimize(objective, x0, args=(float(theta),), method="L-BFGS-B", bounds=bounds)
+        if not res.success:
+            res = minimize(objective, x0, args=(float(theta),), method="Nelder-Mead")
+            if not res.success:
+                return None
+
+        rho, eta = res.x
+        if eta <= 0 or abs(rho) >= 0.999:
+            return None
+
+        return {"rho": float(rho), "eta": float(eta), "theta": float(theta)}
+
+    def total_variance(
+            self,
+            k: NDArray[np.float64],
+            params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        theta = params["theta"]
+        phi_theta = params["eta"] / np.sqrt(theta)
+        return ssvi_total_variance(k, theta, params["rho"], phi_theta)
+
