@@ -75,3 +75,10 @@ def calculate_implied_forward(
     fwd = strike + np.exp(r * tte.astype(float)) * (call_mid.astype(float) - put_mid.astype(float))
     mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
     return fwd.where(mask, np.nan)
+
+
+def choose_leg(strike: float, forward: float, call_mid: float, put_mid: float) -> float:
+    """Choose OTM leg: call if ITM put, put if ITM call."""
+    if strike >= forward:
+        return call_mid if np.isfinite(call_mid) else put_mid
+    return put_mid if np.isfinite(put_mid) else call_mid
