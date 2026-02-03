@@ -110,7 +110,18 @@ class Parametrization(ABC):
 
 
 class SVI(Parametrization):
-    """Raw SVI parametrization."""
+    """Raw SVI total variance parametrization [Gatheral 2004].
+
+    w(k) = a + b {ρ(k-m) + sqrt[(k-m)² + σ²]}
+
+    No-arbitrage constraints softly enforced via bounds/penalties:
+    * b > 0 (positive slope)
+    * |ρ| < 1 (correlation)
+    * σ > 0 (vol of vol)
+
+    Calibrates via L-BFGS-B (bounded) → Nelder-Mead fallback.
+    Initial guess: ATM a, median m, wing-informed b/σ.
+    """
 
     def calibrate(
             self,
@@ -118,6 +129,20 @@ class SVI(Parametrization):
             w_target: NDArray[np.float64],
             **kwargs
     ) -> Optional[Dict[str, float]]:
+        """Minimize MSE(w_model(k), w_target) subject to constraints.
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness array.
+        w_target : NDArray[np.float64]
+            Market total variances σ_mkt²T.
+
+        Returns
+        -------
+        Dict[str, float] or None
+            {'a', 'b', 'rho', 'm', 'sigma'} or None (opt failed).
+        """
         from scipy.optimize import minimize
 
         def objective(params):
@@ -157,11 +182,21 @@ class SVI(Parametrization):
             k: NDArray[np.float64],
             params: Dict[str, float]
     ) -> NDArray[np.float64]:
+        """Evaluate w(k) = a + b{ρ(k-m) + sqrt[(k-m)² + σ²]}."""
         return svi_total_variance(k, **params)
 
 
 class SSVI(Parametrization):
-    """SSVI parametrization."""
+    """Surface-consistent SSVI [Gatheral & Jacquier 2014].
+
+    w(k;θ) = θ/2 [1 + ρ φ(θ) k + sqrt{(φ(θ) k + ρ)² + (1-ρ²)}]
+
+    θ = ATM total variance (fixed per slice, typically σ_ATM² T)
+    φ(θ) = η / sqrt(θ) - curvature scale independent of ATM level
+
+    Guarantees no butterfly arbitrage across strikes for fixed θ.
+    Calibrates only ρ, η (2 params) given θ.
+    """
 
     def calibrate(
             self,
@@ -169,6 +204,22 @@ class SSVI(Parametrization):
             w_target: NDArray[np.float64],
             **kwargs
     ) -> Optional[Dict[str, float]]:
+        """Fit ρ, η minimizing MSE(w_model, w_target) for fixed θ.
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness.
+        w_target : NDArray[np.float64]
+            Market total variances.
+        **kwargs
+            Must contain 'theta': ATM w_ATM.
+
+        Returns
+        -------
+        Dict[str, float] or None
+            {'rho', 'eta', 'theta'} or None.
+        """
         theta = kwargs["theta"]
         from scipy.optimize import minimize
 
@@ -208,7 +259,16 @@ class SSVI(Parametrization):
 
 
 class ESSVI(Parametrization):
-    """eSSVI parametrization."""
+    """Extended SSVI with ρ(θ) parametrization.
+
+    w(k;θ) = θ/2 [1 + ρ(θ) φ(θ) k + sqrt{(φ(θ) k + ρ(θ))² + (1-ρ(θ)²)}]
+
+    ρ(θ) = clip(ρ₀ + ρ₁ (θ/θ_ref)^α, -0.999, 0.999)  ← term structure skew
+    φ(θ) = η / sqrt(θ)                                ← curvature
+
+    θ_ref smooths ρ across maturities (often median ATM θ). 4 params total.
+    Enables realistic calendar skew evolution.
+    """
 
     def calibrate(
             self,
@@ -216,6 +276,25 @@ class ESSVI(Parametrization):
             w_target: NDArray[np.float64],
             **kwargs
     ) -> Optional[Dict[str, float]]:
+        """Fit ρ₀, ρ₁, α, η given θ, θ_ref via penalized MSE.
+
+        Heavy penalty on η≤0, mild on |ρ(θ)|>0.95 for stability.
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness.
+        w_target : NDArray[np.float64]
+            Total variances.
+        **kwargs
+            'theta': slice ATM w
+            'theta_ref': reference θ (defaults to theta)
+
+        Returns
+        -------
+        Dict[str, float] or None
+            All params + computed 'rho_theta'.
+        """
         theta = kwargs["theta"]
         theta_ref= kwargs["theta_ref"]
 
