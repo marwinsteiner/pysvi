@@ -12,12 +12,12 @@ import re
 import numpy as np
 import pandas as pd
 from loguru import logger
-from numpy._typing import NDArray
+from numpy.typing import NDArray
 from scipy.optimize import minimize
 from py_lets_be_rational.exceptions import BelowIntrinsicException
 from py_vollib.black_scholes_merton.implied_volatility import implied_volatility as bsm_iv
 
-from .models import SVI, SSVI, ESSVI
+from .models import SVI, SSVI, ESSVI, Parametrization
 
 warnings.filterwarnings("ignore")
 
@@ -121,3 +121,23 @@ def prepare_slice(
 
     k = np.clip(k[finite], -10.0, 10.0)
     return k, w_target[finite], F
+
+
+def calibrate_slice(
+        df_slice: pd.DataFrame,
+        model: Parametrization,
+        maturity_col: str = "maturity",
+        **model_kwargs
+) -> Optional[Dict[str, float]]:
+    """Calibrate single maturity slice."""
+    k, w_target, F = prepare_slice(df_slice)
+    if k is None:
+        logger.warning("Insufficient data for calibration")
+        return None
+
+    params = model.calibrate(k, w_target, **model_kwargs)
+    if params is None:
+        logger.warning("Calibration failed")
+    else:
+        params["forward"] = F
+    return params
