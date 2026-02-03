@@ -11,39 +11,99 @@ from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
 from numpy.typing import NDArray
 
+
 # @nb.njit(fastmath=True)
 def svi_total_variance(
-    k: np.ndarray,
-    a: float,
-    b: float,
-    rho: float,
-    m: float,
-    sigma: float
+        k: np.ndarray,
+        a: float,
+        b: float,
+        rho: float,
+        m: float,
+        sigma: float
 ) -> np.ndarray:
     """Raw SVI total variance w(k)."""
-    return a + b * (rho * (k - m) + np.sqrt((k - m)**2 + sigma**2))
+    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma ** 2))
+
 
 # @nb.njit(fastmath=True)
 def ssvi_total_variance(
-    k: np.ndarray,
-    theta: float,
-    rho: float,
-    phi_theta: float
+        k: np.ndarray,
+        theta: float,
+        rho: float,
+        phi_theta: float
 ) -> np.ndarray:
     """SSVI total variance w(k)."""
     term1 = 1.0 + rho * phi_theta * k
-    term2 = np.sqrt((phi_theta * k + rho)**2 + (1.0 - rho**2))
+    term2 = np.sqrt((phi_theta * k + rho) ** 2 + (1.0 - rho ** 2))
     return 0.5 * theta * (term1 + term2)
+
 
 # @nb.njit(fastmath=True)
 def essvi_total_variance(
-    k: np.ndarray,
-    theta: float,
-    rho_theta: float,
-    phi_theta: float
+        k: np.ndarray,
+        theta: float,
+        rho_theta: float,
+        phi_theta: float
 ) -> np.ndarray:
     """eSSVI total variance w(k)."""
-    inside = (phi_theta * k + rho_theta)**2 + (1.0 - rho_theta**2)
+    inside = (phi_theta * k + rho_theta) ** 2 + (1.0 - rho_theta ** 2)
     term1 = 1.0 + rho_theta * phi_theta * k
     term2 = np.sqrt(inside)
     return 0.5 * theta * (term1 + term2)
+
+
+class Parametrization(ABC):
+    """Base class for IV surface parametrizations."""
+
+    @abstractmethod
+    def calibrate(
+        self,
+        k: NDArray[np.float64],
+        w_target: NDArray[np.float64],
+        **kwargs
+    ) -> Optional[Dict[str, float]]:
+        """
+        Calibrate parameters from log-moneyness k and total variance w_target.
+
+        Parameters
+        ----------
+        k : np.ndarray
+            Log-moneyness values log(K/F).
+        w_target : np.ndarray
+            Observed total variance values sigma_mkt^2 * T.
+        **kwargs :
+            Extra model-specific arguments (e.g. theta for SSVI/eSSVI).
+
+        Returns
+        -------
+        dict or None
+            Mapping of parameter names to floats, or None on failure.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.calibrate() must be implemented by subclasses."
+        )
+
+    @abstractmethod
+    def total_variance(
+        self,
+        k: NDArray[np.float64],
+        params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """
+        Compute model total variance w(k) given parameters.
+
+        Parameters
+        ----------
+        k : np.ndarray
+            Log-moneyness values log(K/F).
+        params : dict
+            Calibrated parameter dictionary for this parametrization.
+
+        Returns
+        -------
+        np.ndarray
+            Total variance values w(k).
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.total_variance() must be implemented by subclasses."
+        )
