@@ -1,0 +1,15 @@
+[project]
+name = "pysvi"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "loguru>=0.7.3",
+    "numba",
+    "numpy>=2.4.2",
+    "pandas>=3.0.0",
+    "py-lets-be-rational>=1.0.1",
+    "py-vollib>=1.0.1",
+    "scipy>=1.17.0",
+]
