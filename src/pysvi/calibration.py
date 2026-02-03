@@ -14,7 +14,9 @@ import pandas as pd
 from loguru import logger
 from numpy.typing import NDArray
 from py_lets_be_rational.exceptions import BelowIntrinsicException
-from py_vollib.black_scholes_merton.implied_volatility import implied_volatility as bsm_iv
+from py_vollib.black_scholes_merton.implied_volatility import (
+    implied_volatility as bsm_iv,
+)
 
 from .models import SVI, SSVI, ESSVI, Parametrization
 
@@ -51,13 +53,13 @@ def parse_ticker_info(path: Path):
 
 
 def compute_ivs_vectorized(
-        prices: NDArray[np.float64],
-        spots: NDArray[np.float64],
-        strikes: NDArray[np.float64],
-        ttes: NDArray[np.float64],
-        r: float,
-        q: float = 0.0,
-        flags: NDArray[np.str_] = None
+    prices: NDArray[np.float64],
+    spots: NDArray[np.float64],
+    strikes: NDArray[np.float64],
+    ttes: NDArray[np.float64],
+    r: float,
+    q: float = 0.0,
+    flags: NDArray[np.str_] = None,
 ) -> NDArray[np.float64]:
     """Compute Black-Scholes-Merton implied vols from option prices.
 
@@ -89,18 +91,25 @@ def compute_ivs_vectorized(
     """
     n = len(prices)
     if flags is None:
-        flags = np.full(n, 'c', dtype=np.str_)
+        flags = np.full(n, "c", dtype=np.str_)
 
     ivs = np.full(n, np.nan, dtype=np.float64)
     for i in range(n):
-        if not all(np.isfinite(x) and x > 0 for x in [prices[i], spots[i], strikes[i], ttes[i]]):
+        if not all(
+            np.isfinite(x) and x > 0 for x in [prices[i], spots[i], strikes[i], ttes[i]]
+        ):
             continue
         try:
             # Cast to match dtype
             ivs[i] = float(  # ← Explicit float → np.float64
                 bsm_iv(
-                    float(prices[i]), float(spots[i]), float(strikes[i]),
-                    float(ttes[i]), r, q, str(flags[i]).lower()
+                    float(prices[i]),
+                    float(spots[i]),
+                    float(strikes[i]),
+                    float(ttes[i]),
+                    r,
+                    q,
+                    str(flags[i]).lower(),
                 )
             )
         except (BelowIntrinsicException, Exception):
@@ -109,12 +118,12 @@ def compute_ivs_vectorized(
 
 
 def calculate_implied_forward(
-        spot: pd.Series,
-        tte: pd.Series,
-        r: float,
-        strike: pd.Series,
-        call_mid: pd.Series,
-        put_mid: pd.Series
+    spot: pd.Series,
+    tte: pd.Series,
+    r: float,
+    strike: pd.Series,
+    call_mid: pd.Series,
+    put_mid: pd.Series,
 ) -> pd.Series:
     """Compute forward price F from put-call parity on same strike slice.
 
@@ -158,7 +167,9 @@ def calculate_implied_forward(
     1    101.26
     dtype: float64
     """
-    fwd = strike + np.exp(r * tte.astype(float)) * (call_mid.astype(float) - put_mid.astype(float))
+    fwd = strike + np.exp(r * tte.astype(float)) * (
+        call_mid.astype(float) - put_mid.astype(float)
+    )
     mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
     return fwd.where(mask, np.nan)
 
@@ -206,13 +217,15 @@ def choose_leg(strike: float, forward: float, call_mid: float, put_mid: float) -
 
 
 def prepare_slice(
-        df_slice: pd.DataFrame,
-        maturity_col: str = "maturity",
-        strike_col: str = "strike",
-        iv_col: str = "iv",
-        forward_col: str = "implied_forward",
-        min_points: int = 5
-) -> Tuple[Optional[NDArray[np.float64]], Optional[NDArray[np.float64]], Optional[float]]:
+    df_slice: pd.DataFrame,
+    maturity_col: str = "maturity",
+    strike_col: str = "strike",
+    iv_col: str = "iv",
+    forward_col: str = "implied_forward",
+    min_points: int = 5,
+) -> Tuple[
+    Optional[NDArray[np.float64]], Optional[NDArray[np.float64]], Optional[float]
+]:
     """Transform single maturity slice to SVI-ready inputs: k, w_target, F.
 
     Pipeline:
@@ -274,7 +287,7 @@ def prepare_slice(
 
     K, sigma_mkt = K[valid], sigma_mkt[valid]
     k = np.log(K / F)
-    w_target = sigma_mkt ** 2 * T
+    w_target = sigma_mkt**2 * T
     finite = np.isfinite(k) & np.isfinite(w_target)
     if np.sum(finite) < min_points:
         return None, None, None
@@ -284,10 +297,10 @@ def prepare_slice(
 
 
 def calibrate_slice(
-        df_slice: pd.DataFrame,
-        model: Parametrization,
-        maturity_col: str = "maturity",
-        **model_kwargs
+    df_slice: pd.DataFrame,
+    model: Parametrization,
+    maturity_col: str = "maturity",
+    **model_kwargs,
 ) -> Optional[Dict[str, float]]:
     """Calibrate parametrization to single maturity cross-section.
 
@@ -330,14 +343,14 @@ def calibrate_slice(
 
 
 def apply_slice(
-        df_slice: pd.DataFrame,
-        params: Dict[str, float],
-        model: Parametrization,
-        maturity_col: str = "maturity",
-        strike_col: str = "strike",
-        iv_col: str = "iv",
-        fitted_col: str = "fitted_iv",
-        residual_col: str = "residual_iv"
+    df_slice: pd.DataFrame,
+    params: Dict[str, float],
+    model: Parametrization,
+    maturity_col: str = "maturity",
+    strike_col: str = "strike",
+    iv_col: str = "iv",
+    fitted_col: str = "fitted_iv",
+    residual_col: str = "residual_iv",
 ) -> pd.DataFrame:
     """Generate fitted IVs + residuals for calibrated slice.
 
@@ -434,8 +447,4 @@ def get_model(model_name: str) -> Parametrization:
     >>> svi = get_model("SVI")
     >>> ssvi = get_model("ssvi")
     """
-    return {
-        "svi": SVI(),
-        "ssvi": SSVI(),
-        "essvi": ESSVI()
-    }[model_name.lower()]
+    return {"svi": SVI(), "ssvi": SSVI(), "essvi": ESSVI()}[model_name.lower()]

@@ -6,10 +6,19 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "loguru>=0.7.3",
-    "numba",
     "numpy>=2.4.2",
     "pandas>=3.0.0",
     "py-lets-be-rational>=1.0.1",
     "py-vollib>=1.0.1",
     "scipy>=1.17.0",
+]
+
+[dependency-groups]
+dev = [
+    "black[ruff]>=26.1.0",
+    "hypothesis>=6.151.5",
+    "mypy>=1.19.1",
+    "pytest>=9.0.2",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.15.0",
 ]

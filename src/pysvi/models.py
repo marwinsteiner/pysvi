@@ -14,39 +14,28 @@ from numpy.typing import NDArray
 
 # @nb.njit(fastmath=True)
 def svi_total_variance(
-        k: np.ndarray,
-        a: float,
-        b: float,
-        rho: float,
-        m: float,
-        sigma: float
+    k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float
 ) -> np.ndarray:
     """Raw SVI total variance w(k)."""
-    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma ** 2))
+    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma**2))
 
 
 # @nb.njit(fastmath=True)
 def ssvi_total_variance(
-        k: np.ndarray,
-        theta: float,
-        rho: float,
-        phi_theta: float
+    k: np.ndarray, theta: float, rho: float, phi_theta: float
 ) -> np.ndarray:
     """SSVI total variance w(k)."""
     term1 = 1.0 + rho * phi_theta * k
-    term2 = np.sqrt((phi_theta * k + rho) ** 2 + (1.0 - rho ** 2))
+    term2 = np.sqrt((phi_theta * k + rho) ** 2 + (1.0 - rho**2))
     return 0.5 * theta * (term1 + term2)
 
 
 # @nb.njit(fastmath=True)
 def essvi_total_variance(
-        k: np.ndarray,
-        theta: float,
-        rho_theta: float,
-        phi_theta: float
+    k: np.ndarray, theta: float, rho_theta: float, phi_theta: float
 ) -> np.ndarray:
     """eSSVI total variance w(k)."""
-    inside = (phi_theta * k + rho_theta) ** 2 + (1.0 - rho_theta ** 2)
+    inside = (phi_theta * k + rho_theta) ** 2 + (1.0 - rho_theta**2)
     term1 = 1.0 + rho_theta * phi_theta * k
     term2 = np.sqrt(inside)
     return 0.5 * theta * (term1 + term2)
@@ -57,10 +46,7 @@ class Parametrization(ABC):
 
     @abstractmethod
     def calibrate(
-            self,
-            k: NDArray[np.float64],
-            w_target: NDArray[np.float64],
-            **kwargs
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
         """
         Calibrate parameters from log-moneyness k and total variance w_target.
@@ -85,9 +71,7 @@ class Parametrization(ABC):
 
     @abstractmethod
     def total_variance(
-            self,
-            k: NDArray[np.float64],
-            params: Dict[str, float]
+        self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
         """
         Compute model total variance w(k) given parameters.
@@ -124,10 +108,7 @@ class SVI(Parametrization):
     """
 
     def calibrate(
-            self,
-            k: NDArray[np.float64],
-            w_target: NDArray[np.float64],
-            **kwargs
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
         """Minimize MSE(w_model(k), w_target) subject to constraints.
 
@@ -148,9 +129,12 @@ class SVI(Parametrization):
         def objective(params):
             a, b, rho, m, sigma = params
             penalty = 0.0
-            if b <= 0: penalty += 1e6 * (1 - b) ** 2
-            if abs(rho) >= 0.999: penalty += 1e6 * (abs(rho) - 0.999) ** 2
-            if sigma <= 0: penalty += 1e6 * (1 - sigma) ** 2
+            if b <= 0:
+                penalty += 1e6 * (1 - b) ** 2
+            if abs(rho) >= 0.999:
+                penalty += 1e6 * (abs(rho) - 0.999) ** 2
+            if sigma <= 0:
+                penalty += 1e6 * (1 - sigma) ** 2
             w_model = svi_total_variance(k, a, b, rho, m, sigma)
             mse = float(np.mean((w_target - w_model) ** 2))
             return mse + penalty
@@ -162,12 +146,20 @@ class SVI(Parametrization):
         b0 = max(spread / denom, 1e-4)
         x0 = np.array([a0, b0, 0.0, float(np.median(k)), max(float(np.std(k)), 0.1)])
 
-        bounds = [(None, None), (1e-8, None), (-0.999, 0.999), (None, None), (1e-8, None)]
+        bounds = [
+            (None, None),
+            (1e-8, None),
+            (-0.999, 0.999),
+            (None, None),
+            (1e-8, None),
+        ]
 
         res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
         if not res.success:
             # Fallback Nelder-Mead
-            res = minimize(objective, x0, method="Nelder-Mead", options={"maxiter": 2000})
+            res = minimize(
+                objective, x0, method="Nelder-Mead", options={"maxiter": 2000}
+            )
             if not res.success:
                 return None
 
@@ -175,12 +167,16 @@ class SVI(Parametrization):
         if b <= 0 or sigma <= 0 or abs(rho) >= 0.999:
             return None
 
-        return {"a": float(a), "b": float(b), "rho": float(rho), "m": float(m), "sigma": float(sigma)}
+        return {
+            "a": float(a),
+            "b": float(b),
+            "rho": float(rho),
+            "m": float(m),
+            "sigma": float(sigma),
+        }
 
     def total_variance(
-            self,
-            k: NDArray[np.float64],
-            params: Dict[str, float]
+        self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
         """Evaluate w(k) = a + b{ρ(k-m) + sqrt[(k-m)² + σ²]}."""
         return svi_total_variance(k, **params)
@@ -199,10 +195,7 @@ class SSVI(Parametrization):
     """
 
     def calibrate(
-            self,
-            k: NDArray[np.float64],
-            w_target: NDArray[np.float64],
-            **kwargs
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
         """Fit ρ, η minimizing MSE(w_model, w_target) for fixed θ.
 
@@ -226,8 +219,10 @@ class SSVI(Parametrization):
         def objective(params):
             rho, eta = params
             penalty = 0.0
-            if abs(rho) >= 0.999: penalty += 1e6 * (abs(rho) - 0.999) ** 2
-            if eta <= 0: penalty += 1e6 * (1 - eta) ** 2
+            if abs(rho) >= 0.999:
+                penalty += 1e6 * (abs(rho) - 0.999) ** 2
+            if eta <= 0:
+                penalty += 1e6 * (1 - eta) ** 2
             phi_theta = eta / np.sqrt(theta)
             w_model = ssvi_total_variance(k, theta, rho, phi_theta)
             mse = float(np.mean((w_target - w_model) ** 2))
@@ -236,7 +231,9 @@ class SSVI(Parametrization):
         x0 = np.array([0.0, 1.0])
         bounds = [(-0.999, 0.999), (1e-8, None)]
 
-        res = minimize(objective, x0, args=(float(theta),), method="L-BFGS-B", bounds=bounds)
+        res = minimize(
+            objective, x0, args=(float(theta),), method="L-BFGS-B", bounds=bounds
+        )
         if not res.success:
             res = minimize(objective, x0, args=(float(theta),), method="Nelder-Mead")
             if not res.success:
@@ -249,9 +246,7 @@ class SSVI(Parametrization):
         return {"rho": float(rho), "eta": float(eta), "theta": float(theta)}
 
     def total_variance(
-            self,
-            k: NDArray[np.float64],
-            params: Dict[str, float]
+        self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
         theta = params["theta"]
         phi_theta = params["eta"] / np.sqrt(theta)
@@ -271,10 +266,7 @@ class ESSVI(Parametrization):
     """
 
     def calibrate(
-            self,
-            k: NDArray[np.float64],
-            w_target: NDArray[np.float64],
-            **kwargs
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
         """Fit ρ₀, ρ₁, α, η given θ, θ_ref via penalized MSE.
 
@@ -296,7 +288,7 @@ class ESSVI(Parametrization):
             All params + computed 'rho_theta'.
         """
         theta = kwargs["theta"]
-        theta_ref= kwargs["theta_ref"]
+        theta_ref = kwargs["theta_ref"]
 
         from scipy.optimize import minimize
 
@@ -306,9 +298,10 @@ class ESSVI(Parametrization):
         def objective(params):
             rho0, rho1, alpha, eta = params
             penalty = 0.0
-            if eta <= 0: penalty += 1e6 * (1 - eta) ** 2
+            if eta <= 0:
+                penalty += 1e6 * (1 - eta) ** 2
             theta_ratio = theta / max(theta_ref, 1e-12)
-            rho_theta = np.clip(rho0 + rho1 * (theta_ratio ** alpha), -0.999, 0.999)
+            rho_theta = np.clip(rho0 + rho1 * (theta_ratio**alpha), -0.999, 0.999)
             phi_theta = eta / np.sqrt(theta)
             w_model = essvi_total_variance(k, theta, rho_theta, phi_theta)
             mse = float(np.mean((w_target - w_model) ** 2))
@@ -318,9 +311,20 @@ class ESSVI(Parametrization):
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
         bounds = [(-0.999, 0.999), (-2.0, 2.0), (-2.0, 2.0), (1e-8, None)]
 
-        res = minimize(objective, x0, args=(float(theta), float(theta_ref)), method="L-BFGS-B", bounds=bounds)
+        res = minimize(
+            objective,
+            x0,
+            args=(float(theta), float(theta_ref)),
+            method="L-BFGS-B",
+            bounds=bounds,
+        )
         if not res.success:
-            res = minimize(objective, x0, args=(float(theta), float(theta_ref)), method="Nelder-Mead")
+            res = minimize(
+                objective,
+                x0,
+                args=(float(theta), float(theta_ref)),
+                method="Nelder-Mead",
+            )
             if not res.success:
                 return None
 
@@ -329,22 +333,28 @@ class ESSVI(Parametrization):
             return None
 
         theta_ratio = theta / max(theta_ref, 1e-12)
-        rho_theta = np.clip(rho0 + rho1 * (theta_ratio ** alpha), -0.999, 0.999)
+        rho_theta = np.clip(rho0 + rho1 * (theta_ratio**alpha), -0.999, 0.999)
 
         return {
-            "rho0": float(rho0), "rho1": float(rho1), "alpha": float(alpha),
-            "eta": float(eta), "theta": float(theta), "theta_ref": float(theta_ref),
-            "rho_theta": float(rho_theta)
+            "rho0": float(rho0),
+            "rho1": float(rho1),
+            "alpha": float(alpha),
+            "eta": float(eta),
+            "theta": float(theta),
+            "theta_ref": float(theta_ref),
+            "rho_theta": float(rho_theta),
         }
 
     def total_variance(
-            self,
-            k: NDArray[np.float64],
-            params: Dict[str, float]
+        self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
         theta = params["theta"]
-        rho_theta = params.get("rho_theta", params["rho0"] + params["rho1"] *
-                               (theta / max(params["theta_ref"], 1e-12)) ** params["alpha"])
+        rho_theta = params.get(
+            "rho_theta",
+            params["rho0"]
+            + params["rho1"]
+            * (theta / max(params["theta_ref"], 1e-12)) ** params["alpha"],
+        )
         rho_theta = np.clip(rho_theta, -0.999, 0.999)
         phi_theta = params["eta"] / np.sqrt(theta)
         return essvi_total_variance(k, theta, rho_theta, phi_theta)
