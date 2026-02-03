@@ -167,3 +167,13 @@ def apply_slice(
     if iv_col in out:
         out[residual_col] = out[iv_col] - sigma_fit
     return out
+
+
+# Factory
+def get_model(model_name: str) -> Parametrization:
+    """Get parametrization by name."""
+    return {
+        "svi": SVI(),
+        "ssvi": SSVI(),
+        "essvi": ESSVI()
+    }[model_name.lower()]
