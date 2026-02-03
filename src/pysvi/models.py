@@ -57,10 +57,10 @@ class Parametrization(ABC):
 
     @abstractmethod
     def calibrate(
-        self,
-        k: NDArray[np.float64],
-        w_target: NDArray[np.float64],
-        **kwargs
+            self,
+            k: NDArray[np.float64],
+            w_target: NDArray[np.float64],
+            **kwargs
     ) -> Optional[Dict[str, float]]:
         """
         Calibrate parameters from log-moneyness k and total variance w_target.
@@ -85,9 +85,9 @@ class Parametrization(ABC):
 
     @abstractmethod
     def total_variance(
-        self,
-        k: NDArray[np.float64],
-        params: Dict[str, float]
+            self,
+            k: NDArray[np.float64],
+            params: Dict[str, float]
     ) -> NDArray[np.float64]:
         """
         Compute model total variance w(k) given parameters.
@@ -107,3 +107,54 @@ class Parametrization(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__}.total_variance() must be implemented by subclasses."
         )
+
+
+class SVI(Parametrization):
+    """Raw SVI parametrization."""
+
+    def calibrate(
+            self,
+            k: NDArray[np.float64],
+            w_target: NDArray[np.float64],
+            **kwargs
+    ) -> Optional[Dict[str, float]]:
+        from scipy.optimize import minimize
+
+        def objective(params):
+            a, b, rho, m, sigma = params
+            penalty = 0.0
+            if b <= 0: penalty += 1e6 * (1 - b) ** 2
+            if abs(rho) >= 0.999: penalty += 1e6 * (abs(rho) - 0.999) ** 2
+            if sigma <= 0: penalty += 1e6 * (1 - sigma) ** 2
+            w_model = svi_total_variance(k, a, b, rho, m, sigma)
+            mse = float(np.mean((w_target - w_model) ** 2))
+            return mse + penalty
+
+        a0 = float(np.nanmin(w_target))
+        spread = float(np.nanmax(w_target) - a0)
+        k_abs_max = float(np.max(np.abs(k)))
+        denom = max(k_abs_max, 1.0)
+        b0 = max(spread / denom, 1e-4)
+        x0 = np.array([a0, b0, 0.0, float(np.median(k)), max(float(np.std(k)), 0.1)])
+
+        bounds = [(None, None), (1e-8, None), (-0.999, 0.999), (None, None), (1e-8, None)]
+
+        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
+        if not res.success:
+            # Fallback Nelder-Mead
+            res = minimize(objective, x0, method="Nelder-Mead", options={"maxiter": 2000})
+            if not res.success:
+                return None
+
+        a, b, rho, m, sigma = res.x
+        if b <= 0 or sigma <= 0 or abs(rho) >= 0.999:
+            return None
+
+        return {"a": float(a), "b": float(b), "rho": float(rho), "m": float(m), "sigma": float(sigma)}
+
+    def total_variance(
+            self,
+            k: NDArray[np.float64],
+            params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        return svi_total_variance(k, **params)
