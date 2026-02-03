@@ -141,3 +141,29 @@ def calibrate_slice(
     else:
         params["forward"] = F
     return params
+
+
+def apply_slice(
+        df_slice: pd.DataFrame,
+        params: Dict[str, float],
+        model: Parametrization,
+        maturity_col: str = "maturity",
+        strike_col: str = "strike",
+        iv_col: str = "iv",
+        fitted_col: str = "fitted_iv",
+        residual_col: str = "residual_iv"
+) -> pd.DataFrame:
+    """Apply calibrated params to slice."""
+    T = float(df_slice[maturity_col].iloc[0])
+    F = params["forward"]
+    K = df_slice[strike_col].to_numpy(dtype=float)
+    k = np.log(K / F)
+
+    w_fit = model.total_variance(k, params)
+    sigma_fit = np.sqrt(np.maximum(w_fit / T, 0.0))
+
+    out = df_slice.copy()
+    out[fitted_col] = sigma_fit
+    if iv_col in out:
+        out[residual_col] = out[iv_col] - sigma_fit
+    return out
