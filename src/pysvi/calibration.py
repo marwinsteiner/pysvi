@@ -6,12 +6,13 @@ Supports SVI, SSVI, eSSVI via models.Parametrization classes.
 
 import warnings
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import re
 
 import numpy as np
 import pandas as pd
 from loguru import logger
+from numpy._typing import NDArray
 from scipy.optimize import minimize
 from py_lets_be_rational.exceptions import BelowIntrinsicException
 from py_vollib.black_scholes_merton.implied_volatility import implied_volatility as bsm_iv
@@ -82,3 +83,41 @@ def choose_leg(strike: float, forward: float, call_mid: float, put_mid: float) -
     if strike >= forward:
         return call_mid if np.isfinite(call_mid) else put_mid
     return put_mid if np.isfinite(put_mid) else call_mid
+
+
+def prepare_slice(
+        df_slice: pd.DataFrame,
+        maturity_col: str = "maturity",
+        strike_col: str = "strike",
+        iv_col: str = "iv",
+        forward_col: str = "implied_forward",
+        min_points: int = 5
+) -> Tuple[Optional[NDArray[np.float64]], Optional[NDArray[np.float64]], Optional[float]]:
+    """Prepare k (log-moneyness), w_target (total var), forward for calibration."""
+    if df_slice.empty:
+        return None, None, None
+
+    T = float(df_slice[maturity_col].iloc[0])
+    if T <= 0:
+        return None, None, None
+
+    F = float(df_slice[forward_col].iloc[0])
+    if not np.isfinite(F) or F <= 0:
+        return None, None, None
+
+    K = df_slice[strike_col].to_numpy(dtype=float)
+    sigma_mkt = df_slice[iv_col].to_numpy(dtype=float)
+
+    valid = np.isfinite(K) & np.isfinite(sigma_mkt) & (K > 0) & (sigma_mkt > 0)
+    if np.sum(valid) < min_points:
+        return None, None, None
+
+    K, sigma_mkt = K[valid], sigma_mkt[valid]
+    k = np.log(K / F)
+    w_target = sigma_mkt ** 2 * T
+    finite = np.isfinite(k) & np.isfinite(w_target)
+    if np.sum(finite) < min_points:
+        return None, None, None
+
+    k = np.clip(k[finite], -10.0, 10.0)
+    return k, w_target[finite], F
