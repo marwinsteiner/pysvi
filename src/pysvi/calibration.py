@@ -18,10 +18,10 @@ from py_vollib.black_scholes_merton.implied_volatility import implied_volatility
 
 from .models import SVI, SSVI, ESSVI
 
-
 warnings.filterwarnings("ignore")
 
 _ticker_re = re.compile(r"SPY(\d{6})([CP])(\d+)")
+
 
 def parse_ticker_info(path: Path):
     """Parse SPY option ticker from filename."""
@@ -61,3 +61,17 @@ def compute_ivs_vectorized(
         except (BelowIntrinsicException, Exception):
             ivs[i] = np.nan
     return ivs
+
+
+def calculate_implied_forward(
+        spot: pd.Series,
+        tte: pd.Series,
+        r: float,
+        strike: pd.Series,
+        call_mid: pd.Series,
+        put_mid: pd.Series
+) -> pd.Series:
+    """Implied forward from put-call parity."""
+    fwd = strike + np.exp(r * tte.astype(float)) * (call_mid.astype(float) - put_mid.astype(float))
+    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
+    return fwd.where(mask, np.nan)
