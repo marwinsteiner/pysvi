@@ -180,7 +180,8 @@ class SVI(Parametrization):
         self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
         """Evaluate w(k) = a + b{ρ(k-m) + sqrt[(k-m)² + σ²]}."""
-        return svi_total_variance(k, **params)
+        svi_params = {p: params[p] for p in ["a", "b", "rho", "m", "sigma"]}
+        return svi_total_variance(k, **svi_params)
 
 
 class SSVI(Parametrization):
@@ -232,11 +233,9 @@ class SSVI(Parametrization):
         x0 = np.array([0.0, 1.0])
         bounds = [(-0.999, 0.999), (1e-8, None)]
 
-        res = minimize(
-            objective, x0, args=(float(theta),), method="L-BFGS-B", bounds=bounds
-        )
+        res = minimize(objective, x0, args=(k, w_target, float(theta)), method="L-BFGS-B", bounds=bounds)
         if not res.success:
-            res = minimize(objective, x0, args=(float(theta),), method="Nelder-Mead")
+            res = minimize(objective, x0, args=(k, w_target, float(theta)), method="Nelder-Mead")
             if not res.success:
                 return None
 
@@ -312,20 +311,9 @@ class ESSVI(Parametrization):
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
         bounds = [(-0.999, 0.999), (-2.0, 2.0), (-2.0, 2.0), (1e-8, None)]
 
-        res = minimize(
-            objective,
-            x0,
-            args=(float(theta), float(theta_ref)),
-            method="L-BFGS-B",
-            bounds=bounds,
-        )
+        res = minimize(objective, x0, args=(k, w_target, float(theta), float(theta_ref)), method="L-BFGS-B", bounds=bounds)
         if not res.success:
-            res = minimize(
-                objective,
-                x0,
-                args=(float(theta), float(theta_ref)),
-                method="Nelder-Mead",
-            )
+            res = minimize(objective, x0, args=(k, w_target, float(theta), float(theta_ref)), method="Nelder-Mead")
             if not res.success:
                 return None
 
