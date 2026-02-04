@@ -216,7 +216,7 @@ class SSVI(Parametrization):
         theta = kwargs["theta"]
         from scipy.optimize import minimize
 
-        def objective(params):
+        def objective(params, k, w_target, theta):
             rho, eta = params
             penalty = 0.0
             if abs(rho) >= 0.999:
@@ -295,7 +295,7 @@ class ESSVI(Parametrization):
         if theta_ref is None:
             theta_ref = theta
 
-        def objective(params):
+        def objective(params, k, w_target, theta, theta_ref):
             rho0, rho1, alpha, eta = params
             penalty = 0.0
             if eta <= 0:
