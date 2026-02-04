@@ -1,5 +1,5 @@
 [project]
-name = "pysvi"
+name = "py-svi"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -11,6 +11,7 @@ dependencies = [
     "py-lets-be-rational>=1.0.1",
     "py-vollib>=1.0.1",
     "scipy>=1.17.0",
+    "twine>=6.2.0",
 ]
 
 [dependency-groups]
@@ -34,5 +35,5 @@ filterwarnings = [
 cov_source = "src/pysvi"
 
 [build-system]
-requires = ["uv>=0.4.0"]
-build-backend = "uv"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
