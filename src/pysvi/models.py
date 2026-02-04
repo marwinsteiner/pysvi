@@ -17,7 +17,8 @@ def svi_total_variance(
     k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float
 ) -> np.ndarray:
     """Raw SVI total variance w(k)."""
-    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma**2))
+    z = k - m
+    return a + b * (rho * z + np.sqrt(z * z + sigma * sigma))
 
 
 # @nb.njit(fastmath=True)
