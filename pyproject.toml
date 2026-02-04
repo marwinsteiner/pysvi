@@ -22,3 +22,13 @@ dev = [
     "pytest-xdist>=3.8.0",
     "ruff>=0.15.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = "src"
+addopts = "-v --strict-markers --import-mode=importlib"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning"
+]
+cov_source = "src/pysvi"
