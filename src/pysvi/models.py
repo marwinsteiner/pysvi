@@ -531,3 +531,122 @@ class ESSVI(Parametrization):
         rho_theta = np.clip(rho_theta, -0.999, 0.999)
         phi_theta = params["eta"] / np.sqrt(theta)
         return essvi_total_variance(k, theta, rho_theta, phi_theta)
+
+
+class JumpWings(Parametrization):
+    """SVI jump-wings parametrization [Gatheral 2004].
+
+    Parameters are (v_t, psi_t, p_t, c_t, v_tilde_t) per slice at maturity T:
+      v_t       : ATM variance sigma_ATM^2
+      psi_t     : ATM skew (dw/dk at k=0) / (2T)
+      p_t       : left (put) wing slope,  p_t >= 0
+      c_t       : right (call) wing slope, c_t >= 0
+      v_tilde_t : minimum implied variance, v_tilde_t > 0
+
+    Internally converts to raw SVI (a, b, rho, m, sigma) for evaluation.
+    Calibrates 5 jump-wings params via L-BFGS-B with Nelder-Mead fallback.
+    """
+
+    def calibrate(
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
+    ) -> Optional[Dict[str, float]]:
+        """Fit jump-wings params minimizing MSE(w_model, w_target).
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness array.
+        w_target : NDArray[np.float64]
+            Market total variances.
+        **kwargs
+            Must contain 'T': time to expiry in years.
+            Optional 'w_prev': prior slice total variance for calendar arb.
+
+        Returns
+        -------
+        Dict[str, float] or None
+            {'v_t', 'psi_t', 'p_t', 'c_t', 'v_tilde_t', 'T'} or None.
+        """
+        T = kwargs["T"]
+        from scipy.optimize import minimize
+
+        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
+        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
+        need_grid = check_butterfly or check_calendar
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
+        w_prev = kwargs.get("w_prev")
+
+        def objective(params):
+            v_t, psi_t, p_t, c_t, v_tilde_t = params
+            penalty = 0.0
+            if p_t < 0:
+                penalty += 1e6 * p_t**2
+            if c_t < 0:
+                penalty += 1e6 * c_t**2
+            if v_tilde_t <= 0:
+                penalty += 1e6 * (1 - v_tilde_t) ** 2
+            if v_t <= 0:
+                penalty += 1e6 * (1 - v_t) ** 2
+            if v_tilde_t > v_t:
+                penalty += 1e4 * (v_tilde_t - v_t) ** 2
+            w_model = jw_total_variance(k, v_t, psi_t, p_t, c_t, v_tilde_t, T)
+            mse = float(np.mean((w_target - w_model) ** 2))
+            if need_grid and v_t > 0 and v_tilde_t > 0 and p_t >= 0 and c_t >= 0:
+                w_g = jw_total_variance(k_grid, v_t, psi_t, p_t, c_t, v_tilde_t, T)
+                if check_butterfly:
+                    b = (p_t + c_t) / 2.0
+                    if b > 1e-12:
+                        rho = 1.0 - p_t / b
+                        beta = rho - 2.0 * psi_t * np.sqrt(T) / b
+                        beta = np.clip(beta, -0.9999, 0.9999)
+                        alpha_jw = np.sign(beta) * np.sqrt(max(1.0 / (beta**2) - 1.0, 0.0))
+                        denom = -rho + np.sign(alpha_jw) * np.sqrt(1.0 + alpha_jw**2) - alpha_jw * np.sqrt(1.0 - rho**2)
+                        m = (v_t - v_tilde_t) * T / (b * denom) if abs(denom) > 1e-12 else 0.0
+                        sigma = max(abs(alpha_jw * m), 1e-12)
+                        a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho**2)
+                        _, dw_g, d2w_g = _svi_derivatives(k_grid, a, b, rho, m, sigma)
+                        penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+                if check_calendar and w_prev is not None:
+                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
+            return mse + penalty
+
+        # Initial guess from market data
+        v_t0 = float(np.interp(0.0, k, w_target)) / T if T > 0 else 0.04
+        v_tilde_t0 = float(np.nanmin(w_target)) / T if T > 0 else 0.03
+        x0 = np.array([max(v_t0, 1e-4), -0.1, 0.1, 0.1, max(v_tilde_t0, 1e-4)])
+
+        bounds = [
+            (1e-8, None),     # v_t > 0
+            (-5.0, 5.0),      # psi_t
+            (0.0, None),      # p_t >= 0
+            (0.0, None),      # c_t >= 0
+            (1e-8, None),     # v_tilde_t > 0
+        ]
+
+        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
+        if not res.success:
+            res = minimize(objective, x0, method="Nelder-Mead", options={"maxiter": 2000})
+            if not res.success:
+                return None
+
+        v_t, psi_t, p_t, c_t, v_tilde_t = res.x
+        if v_t <= 0 or v_tilde_t <= 0 or p_t < 0 or c_t < 0:
+            return None
+
+        return {
+            "v_t": float(v_t),
+            "psi_t": float(psi_t),
+            "p_t": float(p_t),
+            "c_t": float(c_t),
+            "v_tilde_t": float(v_tilde_t),
+            "T": float(T),
+        }
+
+    def total_variance(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Evaluate w(k) via jump-wings → raw SVI conversion."""
+        return jw_total_variance(
+            k, params["v_t"], params["psi_t"], params["p_t"],
+            params["c_t"], params["v_tilde_t"], params["T"],
+        )
