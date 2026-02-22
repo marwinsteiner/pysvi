@@ -66,6 +66,11 @@ def essvi_total_variance(
 class Parametrization(ABC):
     """Base class for IV surface parametrizations."""
 
+    def __init__(
+        self, arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI
+    ) -> None:
+        self.arbitrage_condition = arbitrage_condition
+
     @abstractmethod
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
