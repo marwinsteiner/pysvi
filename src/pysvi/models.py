@@ -63,6 +63,47 @@ def essvi_total_variance(
     return 0.5 * theta * (term1 + term2)
 
 
+def _butterfly_penalty(
+    k: np.ndarray, w: np.ndarray, dw: np.ndarray, d2w: np.ndarray
+) -> float:
+    """Penalty for butterfly arbitrage violations.
+
+    The call price density is proportional to g(k) where
+
+        g(k) = (1 - k w'/(2w))^2 - (w')^2/4 (1/w + 1/4) + w''/2
+
+    Butterfly arbitrage is absent iff g(k) >= 0 for all k.
+    Returns a penalty proportional to the integral of max(-g, 0).
+    """
+    g = (1.0 - k * dw / (2.0 * w)) ** 2 - (dw**2) / 4.0 * (1.0 / w + 0.25) + d2w / 2.0
+    violations = np.maximum(-g, 0.0)
+    return float(np.sum(violations**2))
+
+
+def _svi_derivatives(
+    k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute w, w', w'' for raw SVI parametrization."""
+    z = k - m
+    r = np.sqrt(z * z + sigma * sigma)
+    w = a + b * (rho * z + r)
+    dw = b * (rho + z / r)
+    d2w = b * sigma**2 / r**3
+    return w, dw, d2w
+
+
+def _ssvi_derivatives(
+    k: np.ndarray, theta: float, rho: float, phi: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute w, w', w'' for SSVI/eSSVI parametrization."""
+    u = phi * k + rho
+    disc = np.sqrt(u**2 + 1.0 - rho**2)
+    w = 0.5 * theta * (1.0 + rho * phi * k + disc)
+    dw = 0.5 * theta * phi * (rho + u / disc)
+    d2w = 0.5 * theta * phi**2 * (1.0 - rho**2) / disc**3
+    return w, dw, d2w
+
+
 class Parametrization(ABC):
     """Base class for IV surface parametrizations."""
 
