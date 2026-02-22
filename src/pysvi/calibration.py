@@ -18,7 +18,7 @@ from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
 
-from .models import SVI, SSVI, ESSVI, Parametrization
+from .models import SVI, SSVI, ESSVI, Parametrization, ArbitrageFreedom
 
 warnings.filterwarnings("ignore")
 
@@ -417,7 +417,10 @@ def apply_slice(
 
 
 # Factory
-def get_model(model_name: str) -> Parametrization:
+def get_model(
+    model_name: str,
+    arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI,
+) -> Parametrization:
     """Factory for parametrization by lowercase name.
 
     Supported:
@@ -431,6 +434,8 @@ def get_model(model_name: str) -> Parametrization:
     ----------
     model_name : str
         'svi', 'ssvi', 'essvi'.
+    arbitrage_condition : ArbitrageFreedom, default QUASI
+        Arbitrage constraints to enforce during calibration.
 
     Returns
     -------
@@ -445,6 +450,11 @@ def get_model(model_name: str) -> Parametrization:
     Examples
     --------
     >>> svi = get_model("SVI")
-    >>> ssvi = get_model("ssvi")
+    >>> ssvi = get_model("ssvi", ArbitrageFreedom.NO_BUTTERFLY)
     """
-    return {"svi": SVI(), "ssvi": SSVI(), "essvi": ESSVI()}[model_name.lower()]
+    models = {
+        "svi": SVI,
+        "ssvi": SSVI,
+        "essvi": ESSVI,
+    }
+    return models[model_name.lower()](arbitrage_condition=arbitrage_condition)
