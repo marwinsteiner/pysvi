@@ -18,7 +18,7 @@ from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
 
-from .models import SVI, SSVI, ESSVI, Parametrization, ArbitrageFreedom
+from .models import SVI, SSVI, ESSVI, JumpWings, Parametrization, ArbitrageFreedom
 
 warnings.filterwarnings("ignore")
 
@@ -456,5 +456,7 @@ def get_model(
         "svi": SVI,
         "ssvi": SSVI,
         "essvi": ESSVI,
+        "jumpwings": JumpWings,
+        "jw": JumpWings,
     }
     return models[model_name.lower()](arbitrage_condition=arbitrage_condition)
