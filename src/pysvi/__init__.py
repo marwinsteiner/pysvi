@@ -1,6 +1,10 @@
 """PySVI: Volatility surface parametrizations."""
 
-__version__ = "0.1.0"
+try:
+    from ._version import __version__
+except ImportError:
+    from importlib.metadata import version
+    __version__ = version("svi-py")
 
 from .models import (SVI, SSVI, ESSVI, JumpWings, ArbitrageFreedom,
                      svi_total_variance, ssvi_total_variance, essvi_total_variance,
