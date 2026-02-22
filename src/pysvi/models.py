@@ -291,6 +291,9 @@ class SSVI(Parametrization):
         theta = kwargs["theta"]
         from scipy.optimize import minimize
 
+        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if check_butterfly else None
+
         def objective(params, k, w_target, theta):
             rho, eta = params
             penalty = 0.0
@@ -301,6 +304,9 @@ class SSVI(Parametrization):
             phi_theta = eta / np.sqrt(theta)
             w_model = ssvi_total_variance(k, theta, rho, phi_theta)
             mse = float(np.mean((w_target - w_model) ** 2))
+            if check_butterfly and eta > 0:
+                w_g, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho, phi_theta)
+                penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
             return mse + penalty
 
         x0 = np.array([0.0, 1.0])
