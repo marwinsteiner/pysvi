@@ -63,6 +63,59 @@ def essvi_total_variance(
     return 0.5 * theta * (term1 + term2)
 
 
+def jw_total_variance(
+    k: np.ndarray, v_t: float, psi_t: float, p_t: float, c_t: float, v_tilde_t: float, T: float
+) -> np.ndarray:
+    """Jump-wings SVI total variance w(k; T).
+
+    The jump-wings parametrization [Gatheral 2004] converts to raw SVI via:
+        b = (p_t + c_t) / 2
+        rho = 1 - p_t / b   (equivalently (c_t - p_t) / (c_t + p_t))
+        beta = rho - 2 * psi_t * sqrt(T) / b
+        alpha = sign(beta) * sqrt(1 / (beta^2) - 1)   when |beta| < 1
+        m = (v_t - v_tilde_t) * T / (b * (-rho + sign(alpha) * sqrt(1 + alpha^2) - alpha * sqrt(1 - rho^2)))
+        sigma = alpha * m
+        a = v_tilde_t * T - b * sigma * sqrt(1 - rho^2)
+
+    Parameters
+    ----------
+    k : array
+        Log-moneyness log(K/F).
+    v_t : float
+        ATM variance (annualised), v_t = sigma_ATM^2.
+    psi_t : float
+        ATM skew dw/dk|_{k=0} / (2 T).
+    p_t : float
+        Left-wing slope (put wing), p_t >= 0.
+    c_t : float
+        Right-wing slope (call wing), c_t >= 0.
+    v_tilde_t : float
+        Minimum implied variance, v_tilde_t > 0.
+    T : float
+        Time to expiry in years.
+
+    Returns
+    -------
+    array
+        Total variance w(k) = sigma^2(k) * T.
+    """
+    b = (p_t + c_t) / 2.0
+    if b < 1e-12:
+        return np.full_like(k, v_t * T, dtype=np.float64)
+    rho = 1.0 - p_t / b
+    beta = rho - 2.0 * psi_t * np.sqrt(T) / b
+    beta = np.clip(beta, -0.9999, 0.9999)
+    alpha = np.sign(beta) * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
+    denom = -rho + np.sign(alpha) * np.sqrt(1.0 + alpha * alpha) - alpha * np.sqrt(1.0 - rho * rho)
+    if abs(denom) < 1e-12:
+        m = 0.0
+    else:
+        m = (v_t - v_tilde_t) * T / (b * denom)
+    sigma = max(abs(alpha * m), 1e-12)
+    a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho * rho)
+    return svi_total_variance(k, a, b, rho, m, sigma)
+
+
 def _butterfly_penalty(
     k: np.ndarray, w: np.ndarray, dw: np.ndarray, d2w: np.ndarray
 ) -> float:
