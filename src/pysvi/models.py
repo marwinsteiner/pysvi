@@ -104,6 +104,31 @@ def _ssvi_derivatives(
     return w, dw, d2w
 
 
+def _calendar_penalty(
+    k_grid: np.ndarray, w_current: np.ndarray, w_prev: np.ndarray
+) -> float:
+    """Penalty for calendar spread arbitrage violations.
+
+    Calendar arbitrage is absent iff total variance is non-decreasing in
+    maturity for every log-moneyness k.  That is, w(k, T2) >= w(k, T1)
+    for T2 > T1.
+
+    Parameters
+    ----------
+    k_grid : array
+        Common evaluation grid.
+    w_current : array
+        Total variance of the current (later) slice on k_grid.
+    w_prev : array
+        Total variance of the prior (earlier) slice on k_grid.
+
+    Returns sum-of-squares of violations.
+    """
+    diff = w_prev - w_current  # positive where calendar arb exists
+    violations = np.maximum(diff, 0.0)
+    return float(np.sum(violations**2))
+
+
 class Parametrization(ABC):
     """Base class for IV surface parametrizations."""
 
