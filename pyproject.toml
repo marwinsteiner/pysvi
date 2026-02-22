@@ -34,7 +34,6 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::FutureWarning"
 ]
-cov_source = "src/pysvi"
 
 [build-system]
 requires = ["hatchling"]
