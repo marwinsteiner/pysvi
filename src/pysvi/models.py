@@ -105,7 +105,10 @@ def jw_total_variance(
     rho = 1.0 - p_t / b
     beta = rho - 2.0 * psi_t * np.sqrt(T) / b
     beta = np.clip(beta, -0.9999, 0.9999)
-    alpha = np.sign(beta) * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
+    if abs(beta) < 1e-12:
+        alpha = 0.0
+    else:
+        alpha = np.sign(beta) * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
     denom = -rho + np.sign(alpha) * np.sqrt(1.0 + alpha * alpha) - alpha * np.sqrt(1.0 - rho * rho)
     if abs(denom) < 1e-12:
         m = 0.0
