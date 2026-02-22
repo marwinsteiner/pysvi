@@ -122,3 +122,46 @@ def test_calendar_penalty_helper():
 
     # Swap: later slice has less total var → violation
     assert _calendar_penalty(k_grid, w_early, w_later) > 0.0
+
+
+def test_jw_total_variance_atm():
+    """Jump-wings ATM total variance matches v_t * T."""
+    from src.pysvi.models import jw_total_variance
+    k = np.array([0.0])
+    T = 0.25
+    v_t = 0.04
+    w = jw_total_variance(k, v_t=v_t, psi_t=-0.1, p_t=0.15, c_t=0.05, v_tilde_t=0.035, T=T)
+    np.testing.assert_allclose(w[0], v_t * T, rtol=1e-6)
+
+
+def test_jw_total_variance_symmetry():
+    """Symmetric wings (p_t == c_t) with zero skew gives symmetric smile."""
+    from src.pysvi.models import jw_total_variance
+    k = np.array([-0.1, 0.1])
+    w = jw_total_variance(k, v_t=0.04, psi_t=0.0, p_t=0.1, c_t=0.1, v_tilde_t=0.035, T=0.25)
+    np.testing.assert_allclose(w[0], w[1], rtol=1e-6)
+
+
+def test_jw_factory():
+    """Factory returns JumpWings for 'jw' and 'jumpwings'."""
+    assert isinstance(get_model("jw"), JumpWings)
+    assert isinstance(get_model("jumpwings"), JumpWings)
+
+
+def test_jw_roundtrip(jw_calibrated):
+    """End-to-end JumpWings: calibrate -> apply -> RMSE < 2.5%."""
+    from src.pysvi.calibration import apply_slice
+    model, df_slice, params = jw_calibrated
+    fitted = apply_slice(df_slice, params, model)
+    rmse = float(np.sqrt(np.mean(fitted["residual_iv"] ** 2)))
+    assert rmse < 0.025
+
+
+def test_jw_no_butterfly_calibration(atm_slice):
+    """JumpWings with NO_BUTTERFLY produces valid density."""
+    from src.pysvi.calibration import prepare_slice, calibrate_slice
+    model = JumpWings(arbitrage_condition=ArbitrageFreedom.NO_BUTTERFLY)
+    T = float(atm_slice["maturity"].iloc[0])
+    params = calibrate_slice(atm_slice, model, T=T)
+    assert params is not None
+    assert params["v_t"] > 0

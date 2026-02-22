@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 
 # src/pysvi absolute imports (tests/ and src/ siblings)
 from src.pysvi.models import (
-    SVI, SSVI, ESSVI,
+    SVI, SSVI, ESSVI, JumpWings,
     svi_total_variance
 )
 from src.pysvi.calibration import (
@@ -122,4 +122,19 @@ def essvi_calibrated(atm_slice) -> Tuple[ESSVI, pd.DataFrame, Dict[str, float]]:
     assert params["theta"] == theta
     assert params["eta"] > 0
     assert abs(params["rho_theta"]) < 0.999
+    return model, df_slice, params
+
+
+@pytest.fixture
+def jw_calibrated(atm_slice) -> Tuple[JumpWings, pd.DataFrame, Dict[str, float]]:
+    """JumpWings + slice + guaranteed calibration."""
+    df_slice = atm_slice
+    model = cast(JumpWings, get_model("jw"))
+    T = float(df_slice["maturity"].iloc[0])
+    params = calibrate_slice(df_slice, model, T=T)
+    assert params is not None
+    assert params["v_t"] > 0
+    assert params["v_tilde_t"] > 0
+    assert params["p_t"] >= 0
+    assert params["c_t"] >= 0
     return model, df_slice, params
