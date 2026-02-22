@@ -220,7 +220,10 @@ class SVI(Parametrization):
         from scipy.optimize import minimize
 
         check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if check_butterfly else None
+        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
+        need_grid = check_butterfly or check_calendar
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
+        w_prev = kwargs.get("w_prev")
 
         def objective(params):
             a, b, rho, m, sigma = params
@@ -233,9 +236,13 @@ class SVI(Parametrization):
                 penalty += 1e6 * (1 - sigma) ** 2
             w_model = svi_total_variance(k, a, b, rho, m, sigma)
             mse = float(np.mean((w_target - w_model) ** 2))
-            if check_butterfly and b > 0 and sigma > 0:
-                w_g, dw_g, d2w_g = _svi_derivatives(k_grid, a, b, rho, m, sigma)
-                penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+            if need_grid and b > 0 and sigma > 0:
+                w_g = svi_total_variance(k_grid, a, b, rho, m, sigma)
+                if check_butterfly:
+                    _, dw_g, d2w_g = _svi_derivatives(k_grid, a, b, rho, m, sigma)
+                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+                if check_calendar and w_prev is not None:
+                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
             return mse + penalty
 
         a0 = float(np.nanmin(w_target))
@@ -317,7 +324,10 @@ class SSVI(Parametrization):
         from scipy.optimize import minimize
 
         check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if check_butterfly else None
+        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
+        need_grid = check_butterfly or check_calendar
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
+        w_prev = kwargs.get("w_prev")
 
         def objective(params, k, w_target, theta):
             rho, eta = params
@@ -329,9 +339,13 @@ class SSVI(Parametrization):
             phi_theta = eta / np.sqrt(theta)
             w_model = ssvi_total_variance(k, theta, rho, phi_theta)
             mse = float(np.mean((w_target - w_model) ** 2))
-            if check_butterfly and eta > 0:
-                w_g, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho, phi_theta)
-                penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+            if need_grid and eta > 0:
+                w_g = ssvi_total_variance(k_grid, theta, rho, phi_theta)
+                if check_butterfly:
+                    _, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho, phi_theta)
+                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+                if check_calendar and w_prev is not None:
+                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
             return mse + penalty
 
         x0 = np.array([0.0, 1.0])
@@ -400,7 +414,10 @@ class ESSVI(Parametrization):
             theta_ref = theta
 
         check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if check_butterfly else None
+        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
+        need_grid = check_butterfly or check_calendar
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
+        w_prev = kwargs.get("w_prev")
 
         def objective(params, k, w_target, theta, theta_ref):
             rho0, rho1, alpha, eta = params
@@ -413,9 +430,13 @@ class ESSVI(Parametrization):
             w_model = essvi_total_variance(k, theta, rho_theta, phi_theta)
             mse = float(np.mean((w_target - w_model) ** 2))
             penalty += 1e2 * max(0.0, abs(rho_theta) - 0.95)
-            if check_butterfly and eta > 0:
-                w_g, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho_theta, phi_theta)
-                penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+            if need_grid and eta > 0:
+                w_g = essvi_total_variance(k_grid, theta, rho_theta, phi_theta)
+                if check_butterfly:
+                    _, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho_theta, phi_theta)
+                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+                if check_calendar and w_prev is not None:
+                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
             return mse + penalty
 
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
