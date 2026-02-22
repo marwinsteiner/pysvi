@@ -8,8 +8,29 @@ Extensible via Parametrization ABC.
 # import numba as nb
 import numpy as np
 from abc import ABC, abstractmethod
+from enum import Flag, auto
 from typing import Dict, Optional
 from numpy.typing import NDArray
+
+
+class ArbitrageFreedom(Flag):
+    """Configurable arbitrage-freeness constraints for IV parametrizations.
+
+    Combine flags with ``|`` to enforce multiple conditions simultaneously.
+
+    Attributes
+    ----------
+    QUASI : default
+        Soft parameter-bound constraints only (b > 0, |rho| < 1, sigma > 0).
+    NO_BUTTERFLY : flag
+        Enforce non-negative density g(k) >= 0 across strikes (no static arb).
+    NO_CALENDAR : flag
+        Enforce non-decreasing total variance in maturity (no calendar spread arb).
+    """
+
+    QUASI = 0
+    NO_BUTTERFLY = auto()
+    NO_CALENDAR = auto()
 
 
 # @nb.njit(fastmath=True)
