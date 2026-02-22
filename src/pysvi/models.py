@@ -374,6 +374,9 @@ class ESSVI(Parametrization):
         if theta_ref is None:
             theta_ref = theta
 
+        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if check_butterfly else None
+
         def objective(params, k, w_target, theta, theta_ref):
             rho0, rho1, alpha, eta = params
             penalty = 0.0
@@ -385,6 +388,9 @@ class ESSVI(Parametrization):
             w_model = essvi_total_variance(k, theta, rho_theta, phi_theta)
             mse = float(np.mean((w_target - w_model) ** 2))
             penalty += 1e2 * max(0.0, abs(rho_theta) - 0.95)
+            if check_butterfly and eta > 0:
+                w_g, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho_theta, phi_theta)
+                penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
             return mse + penalty
 
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
