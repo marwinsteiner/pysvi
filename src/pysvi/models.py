@@ -194,6 +194,9 @@ class SVI(Parametrization):
         """
         from scipy.optimize import minimize
 
+        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if check_butterfly else None
+
         def objective(params):
             a, b, rho, m, sigma = params
             penalty = 0.0
@@ -205,6 +208,9 @@ class SVI(Parametrization):
                 penalty += 1e6 * (1 - sigma) ** 2
             w_model = svi_total_variance(k, a, b, rho, m, sigma)
             mse = float(np.mean((w_target - w_model) ** 2))
+            if check_butterfly and b > 0 and sigma > 0:
+                w_g, dw_g, d2w_g = _svi_derivatives(k_grid, a, b, rho, m, sigma)
+                penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
             return mse + penalty
 
         a0 = float(np.nanmin(w_target))
