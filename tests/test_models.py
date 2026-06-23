@@ -165,3 +165,58 @@ def test_jw_no_butterfly_calibration(atm_slice):
     params = calibrate_slice(atm_slice, model, T=T)
     assert params is not None
     assert params["v_t"] > 0
+
+
+# ── DirectSVI tests ──────────────────────────────────────────────────
+
+def test_directsvi_total_variance_formula():
+    """Verify conic evaluation matches manual quadratic-formula calculation."""
+    from src.pysvi.models import directsvi_total_variance
+    k = np.array([0.0, 0.1, -0.1])
+    z0, z1, z2, z3, z4, z5 = 1.0, 1.0, -0.5, 0.1, -2.0, 0.04
+    # Manual: A=z1, B=z2*x+z4, C=z0*x^2+z3*x+z5
+    # y = (-B + sqrt(B^2 - 4AC)) / (2A)
+    for i, x in enumerate(k):
+        A = z1
+        B = z2 * x + z4
+        C = z0 * x**2 + z3 * x + z5
+        expected = (-B + np.sqrt(B**2 - 4 * A * C)) / (2 * A)
+        result = directsvi_total_variance(np.array([x]), z0, z1, z2, z3, z4, z5)
+        np.testing.assert_allclose(result[0], expected, rtol=1e-10)
+
+
+def test_directsvi_fit_recovers_svi():
+    """Generate data from known SVI params, fit with DirectSVI, verify low RMSE."""
+    from src.pysvi.models import directsvi_fit, directsvi_total_variance
+    k = np.linspace(-0.3, 0.3, 50)
+    w_true = svi_total_variance(k, a=0.01, b=0.1, rho=-0.5, m=0.0, sigma=0.2)
+    z = directsvi_fit(k, w_true)
+    w_fit = directsvi_total_variance(k, *z)
+    rmse = float(np.sqrt(np.mean((w_true - w_fit) ** 2)))
+    assert rmse < 1e-6, f"DirectSVI RMSE too high: {rmse}"
+
+
+def test_directsvi_factory():
+    """get_model("directsvi") and get_model("dsvi") return DirectSVI."""
+    from src.pysvi.models import DirectSVI
+    assert isinstance(get_model("directsvi"), DirectSVI)
+    assert isinstance(get_model("dsvi"), DirectSVI)
+
+
+def test_directsvi_roundtrip(directsvi_calibrated):
+    """End-to-end DirectSVI: calibrate -> apply -> RMSE < 2.5%."""
+    from src.pysvi.calibration import apply_slice
+    model, df_slice, params = directsvi_calibrated
+    fitted = apply_slice(df_slice, params, model)
+    rmse = float(np.sqrt(np.mean(fitted["residual_iv"] ** 2)))
+    assert rmse < 0.025, f"DirectSVI roundtrip RMSE too high: {rmse}"
+
+
+@given(k=st.lists(st.floats(-1.0, 1.0), min_size=1, max_size=100))
+def test_directsvi_positivity(k):
+    """DirectSVI total variance always non-negative."""
+    from src.pysvi.models import directsvi_total_variance
+    k = np.array(k)
+    z0, z1, z2, z3, z4, z5 = 1.0, 1.0, -0.5, 0.1, -2.0, 0.04
+    w = directsvi_total_variance(k, z0, z1, z2, z3, z4, z5)
+    assert np.all(w >= -1e-8)
