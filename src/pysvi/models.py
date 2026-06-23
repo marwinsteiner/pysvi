@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from enum import Flag, auto
 from typing import Dict, Optional
 from numpy.typing import NDArray
+from loguru import logger
 
 
 class ArbitrageFreedom(Flag):
@@ -652,4 +653,177 @@ class JumpWings(Parametrization):
         return jw_total_variance(
             k, params["v_t"], params["psi_t"], params["p_t"],
             params["c_t"], params["v_tilde_t"], params["T"],
+        )
+
+
+def directsvi_fit(
+    k: NDArray[np.float64], w: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Direct algebraic SVI fit via conic section eigenvalue problem.
+
+    Linearises the SVI equation as a hyperbola in (x, y) = (k, w) space:
+
+        z₀x² + z₁y² + z₂xy + z₃x + z₄y + z₅ = 0
+
+    and solves for the 6 conic coefficients via a constrained eigenvalue
+    problem (hyperbola constraint: z₂² − 4z₀z₁ > 0).
+
+    Parameters
+    ----------
+    k : array
+        Log-moneyness values.
+    w : array
+        Total variance values (market observed).
+
+    Returns
+    -------
+    ndarray, shape (6,)
+        Conic coefficients [z0, z1, z2, z3, z4, z5] normalised so z1 = 1.
+
+    References
+    ----------
+    Schadner, W. "Direct Fit for SVI Implied Volatilities", Journal of
+    Derivatives (forthcoming). Implementation based on wol-fi/directSVI.
+    """
+    x = np.asarray(k, dtype=np.float64)
+    y = np.asarray(w, dtype=np.float64)
+
+    # Design matrices: D2 = [x², y²], D1 = [xy, x, y, 1]
+    D2 = np.column_stack([x**2, y**2])
+    D1 = np.column_stack([x * y, x, y, np.ones_like(x)])
+
+    # Scatter matrices
+    S22 = D2.T @ D2
+    S21 = D2.T @ D1
+    S11 = D1.T @ D1
+
+    # Constraint matrix for hyperbola: z2² - 4*z0*z1 > 0
+    # C1 encodes the quadratic form on the [z0, z1] block
+    C1 = np.array([[0.0, -2.0], [-2.0, 0.0]])
+
+    # Solve generalised eigenvalue problem: M @ a2 = lambda * C1 @ a2
+    # where M = S22 - S21 @ inv(S11) @ S21.T
+    S11_inv = np.linalg.inv(S11)
+    M = S22 - S21 @ S11_inv @ S21.T
+
+    eigvals, eigvecs = np.linalg.eig(np.linalg.inv(C1) @ M)
+
+    # Select eigenvector for smallest positive eigenvalue
+    real_mask = np.isreal(eigvals)
+    eigvals_real = np.real(eigvals)
+    pos_mask = real_mask & (eigvals_real > 0)
+    if not np.any(pos_mask):
+        # Fallback: use eigenvector with smallest absolute eigenvalue
+        idx = np.argmin(np.abs(eigvals_real))
+    else:
+        idx = np.where(pos_mask)[0][np.argmin(eigvals_real[pos_mask])]
+
+    a2 = np.real(eigvecs[:, idx])
+    a1 = -S11_inv @ S21.T @ a2
+
+    z = np.concatenate([a2, a1])  # [z0, z1, z2, z3, z4, z5]
+
+    # Normalise so z[1] = 1 (coefficient of y²)
+    if abs(z[1]) > 1e-15:
+        z = z / z[1]
+
+    return z
+
+
+def directsvi_total_variance(
+    k: NDArray[np.float64],
+    z0: float, z1: float, z2: float, z3: float, z4: float, z5: float,
+) -> NDArray[np.float64]:
+    """Evaluate the DirectSVI conic for given log-moneyness.
+
+    Solves the conic z₀x² + z₁y² + z₂xy + z₃x + z₄y + z₅ = 0 for y
+    via the quadratic formula:
+
+        y = (−(z₂x + z₄) + √((z₂x + z₄)² − 4z₁(z₀x² + z₃x + z₅))) / (2z₁)
+
+    Selects the positive root (total variance must be non-negative).
+
+    Parameters
+    ----------
+    k : array
+        Log-moneyness.
+    z0, z1, z2, z3, z4, z5 : float
+        Conic coefficients.
+
+    Returns
+    -------
+    array
+        Total variance w(k).
+    """
+    x = np.asarray(k, dtype=np.float64)
+    A = z1
+    B = z2 * x + z4
+    C = z0 * x**2 + z3 * x + z5
+
+    discriminant = B**2 - 4.0 * A * C
+    discriminant = np.maximum(discriminant, 0.0)
+
+    y1 = (-B + np.sqrt(discriminant)) / (2.0 * A)
+    y2 = (-B - np.sqrt(discriminant)) / (2.0 * A)
+
+    # Choose the non-negative root; prefer y1, fall back to y2
+    y = np.where(y1 >= 0, y1, y2)
+    return np.maximum(y, 0.0)
+
+
+class DirectSVI(Parametrization):
+    """Direct algebraic SVI fit via conic section [Schadner].
+
+    Linearises the SVI total variance curve as a hyperbola:
+
+        z₀k² + z₁w² + z₂kw + z₃k + z₄w + z₅ = 0
+
+    and solves a constrained eigenvalue problem for the 6 conic
+    coefficients — no iterative optimisation needed.
+
+    The direct fit is fast and robust but does not support penalty-based
+    arbitrage enforcement (NO_BUTTERFLY / NO_CALENDAR). Only
+    ArbitrageFreedom.QUASI is meaningful.
+    """
+
+    def calibrate(
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
+    ) -> Optional[Dict[str, float]]:
+        """Fit conic coefficients via direct eigenvalue solve.
+
+        Parameters
+        ----------
+        k : array
+            Log-moneyness.
+        w_target : array
+            Market total variances.
+
+        Returns
+        -------
+        dict or None
+            {'z0', 'z1', 'z2', 'z3', 'z4', 'z5'}.
+        """
+        if self.arbitrage_condition != ArbitrageFreedom.QUASI:
+            logger.warning(
+                "DirectSVI only supports QUASI arbitrage condition; "
+                "NO_BUTTERFLY / NO_CALENDAR flags are ignored."
+            )
+
+        z = directsvi_fit(k, w_target)
+        return {
+            "z0": float(z[0]),
+            "z1": float(z[1]),
+            "z2": float(z[2]),
+            "z3": float(z[3]),
+            "z4": float(z[4]),
+            "z5": float(z[5]),
+        }
+
+    def total_variance(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Evaluate w(k) from conic coefficients."""
+        return directsvi_total_variance(
+            k, params["z0"], params["z1"], params["z2"],
+            params["z3"], params["z4"], params["z5"],
         )
