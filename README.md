@@ -47,6 +47,13 @@ T = float(df_slice["maturity"].iloc[0])
 params = calibrate_slice(df_slice, model, T=T)
 ```
 
+DirectSVI requires no extra arguments — it fits directly from log-moneyness and total variance:
+
+```python
+model = get_model("dsvi")
+params = calibrate_slice(df_slice, model)
+```
+
 ### Where do the inputs come from?
 
 `svi-py` expects you to already have implied volatilities and forward prices. If you're starting from raw option prices, the library provides helpers:
@@ -100,6 +107,29 @@ Extends SSVI with maturity-dependent skew via a $\rho(\theta)$ term structure:
 $$\rho(\theta) = \text{clip}\!\left(\rho_0 + \rho_1 \left(\frac{\theta}{\theta_{\text{ref}}}\right)^\alpha,\; -1,\; 1\right)$$
 
 The total variance formula is the same as SSVI but with $\rho \to \rho(\theta)$. This adds 4 parameters globally ($\rho_0, \rho_1, \alpha, \eta$) and enables realistic calendar skew evolution across maturities. $\theta_{\text{ref}}$ is a reference ATM total variance (typically the median across slices) that normalises the power law.
+
+### DirectSVI
+
+A closed-form SVI calibration method (Schadner, forthcoming) that linearises the SVI equation by rewriting it as a conic section (hyperbola) in $(k, w)$ space:
+
+$$z_0 k^2 + z_1 w^2 + z_2 kw + z_3 k + z_4 w + z_5 = 0$$
+
+The 6 conic coefficients $z$ are found by solving a quadratically constrained eigenvalue problem (hyperbola constraint $z_2^2 - 4z_0 z_1 > 0$):
+
+1. Build design matrices $D_2 = [k^2,\; w^2]$ and $D_1 = [kw,\; k,\; w,\; 1]$
+2. Compute scatter matrices $S_{22}, S_{21}, S_{11}$
+3. Solve $M\mathbf{a}_2 = \lambda\, C_1\mathbf{a}_2$ where $M = S_{22} - S_{21}S_{11}^{-1}S_{21}^\top$ and $C_1 = \begin{pmatrix}0 & -2\\-2 & 0\end{pmatrix}$
+4. Select eigenvector for smallest positive eigenvalue; recover remaining coefficients via $\mathbf{a}_1 = -S_{11}^{-1}S_{21}^\top\mathbf{a}_2$
+
+Evaluation solves the conic for $w$ given $k$ via the quadratic formula. No iterative optimisation is needed, making this the fastest calibration method in the library.
+
+| Parameter | Meaning |
+|-----------|---------|
+| $z_0$ – $z_5$ | Conic section coefficients (normalised so $z_1 = 1$) |
+
+> **Note:** DirectSVI does not support penalty-based arbitrage enforcement (`NO_BUTTERFLY` / `NO_CALENDAR`). Only `ArbitrageFreedom.QUASI` is meaningful.
+
+**Reference:** Schadner, W. "Direct Fit for SVI Implied Volatilities", *Journal of Derivatives* (forthcoming). See also [`wol-fi/directSVI`](https://github.com/wol-fi/directSVI).
 
 ### Jump-Wings
 
@@ -175,7 +205,7 @@ All models calibrate via L-BFGS-B (bounded quasi-Newton) with automatic Nelder-M
 2. **`model.calibrate`**: minimises MSE$(w_{\text{model}}, w_{\text{target}})$ plus penalty terms.
 3. **`apply_slice`**: evaluates the fitted surface, computes $\sigma_{\text{fit}} = \sqrt{w/T}$ and residuals.
 
-The factory function `get_model(name)` accepts `"svi"`, `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`).
+The factory function `get_model(name)` accepts `"svi"`, `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), and `"directsvi"` (or `"dsvi"`).
 
 ## Contributing
 
