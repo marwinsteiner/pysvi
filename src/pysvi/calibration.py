@@ -77,7 +77,7 @@ def compute_ivs_vectorized(
         Risk-free rate (continuous).
     q : float, default 0.0
         Dividend yield (continuous).
-    flags : NDArray[np.str_], optional
+    flags : array of str, optional
         'c'/'C' for calls, 'p'/'P' for puts.
 
     Returns

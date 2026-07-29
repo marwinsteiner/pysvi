@@ -22,7 +22,7 @@ class ArbitrageFreedom(Flag):
     Attributes
     ----------
     QUASI : default
-        Soft parameter-bound constraints only (b > 0, |rho| < 1, sigma > 0).
+        Soft parameter-bound constraints only (b > 0, abs(rho) < 1, sigma > 0).
     NO_BUTTERFLY : flag
         Enforce non-negative density g(k) >= 0 across strikes (no static arb).
     NO_CALENDAR : flag
@@ -73,7 +73,7 @@ def jw_total_variance(
         b = (p_t + c_t) / 2
         rho = 1 - p_t / b   (equivalently (c_t - p_t) / (c_t + p_t))
         beta = rho - 2 * psi_t * sqrt(T) / b
-        alpha = sign(beta) * sqrt(1 / (beta^2) - 1)   when |beta| < 1
+        alpha = sign(beta) * sqrt(1 / (beta^2) - 1)   when abs(beta) < 1
         m = (v_t - v_tilde_t) * T / (b * (-rho + sign(alpha) * sqrt(1 + alpha^2) - alpha * sqrt(1 - rho^2)))
         sigma = alpha * m
         a = v_tilde_t * T - b * sigma * sqrt(1 - rho^2)
@@ -158,7 +158,7 @@ def sabr_implied_vol(
         beta = 1 (lognormal) for FX/equity, beta ~ 0.5 for interest rates,
         beta = 0 (normal) for spread-like underlyings.
     rho : float
-        Spot/vol correlation, |rho| < 1.
+        Spot/vol correlation, abs(rho) < 1.
     nu : float
         Vol-of-vol, nu >= 0.
     F : float
@@ -361,7 +361,7 @@ class SVI(Parametrization):
 
     No-arbitrage constraints softly enforced via bounds/penalties:
     * b > 0 (positive slope)
-    * |ρ| < 1 (correlation)
+    * abs(ρ) < 1 (correlation)
     * σ > 0 (vol of vol)
 
     Calibrates via L-BFGS-B (bounded) → Nelder-Mead fallback.
@@ -556,7 +556,7 @@ class ESSVI(Parametrization):
     ) -> Optional[Dict[str, float]]:
         """Fit ρ₀, ρ₁, α, η given θ, θ_ref via penalized MSE.
 
-        Heavy penalty on η≤0, mild on |ρ(θ)|>0.95 for stability.
+        Heavy penalty on η≤0, mild on abs(ρ(θ))>0.95 for stability.
 
         Parameters
         ----------
