@@ -11,7 +11,7 @@ Stochastic volatility inspired (SVI) parametrizations of the implied volatility 
 
 `svi-py` calibrates smooth, arbitrage-aware total variance surfaces from panels of European option prices: raw SVI, SSVI, eSSVI, jump-wings, DirectSVI, and SABR behind one interface, with configurable no-arbitrage constraints and a full data-preparation pipeline.
 
-**📖 Full documentation: [pysvi.readthedocs.io](https://pysvi.readthedocs.io)**
+**Full documentation: [pysvi.readthedocs.io](https://pysvi.readthedocs.io)**
 
 ## Installation
 
