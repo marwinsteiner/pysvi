@@ -120,6 +120,117 @@ def jw_total_variance(
     return svi_total_variance(k, a, b, rho, m, sigma)
 
 
+def sabr_implied_vol(
+    k: np.ndarray, alpha: float, beta: float, rho: float, nu: float,
+    F: float, T: float,
+) -> np.ndarray:
+    """SABR lognormal (Black) implied volatility via Hagan et al. (2002).
+
+    The SABR model [Hagan, Kumar, Lesniewski, Woodward 2002] assumes
+    forward dynamics
+
+        dF = alpha * F^beta dW1,   d(alpha) = nu * alpha dW2,
+        d<W1, W2> = rho dt
+
+    and admits the asymptotic implied-vol expansion (HKLW formula)
+
+        sigma_B(K, F) = alpha / [(FK)^((1-beta)/2) * D(L)] * (z / x(z))
+                        * {1 + [ (1-beta)^2 alpha^2 / (24 (FK)^(1-beta))
+                               + rho beta nu alpha / (4 (FK)^((1-beta)/2))
+                               + (2 - 3 rho^2) nu^2 / 24 ] T}
+
+    where L = log(F/K),
+        D(L) = 1 + (1-beta)^2/24 L^2 + (1-beta)^4/1920 L^4,
+        z    = (nu/alpha) (FK)^((1-beta)/2) L,
+        x(z) = log[(sqrt(1 - 2 rho z + z^2) + z - rho) / (1 - rho)].
+
+    At the money z -> 0 and z/x(z) -> 1; the singularity is handled via
+    the Taylor expansion z/x(z) = 1 - rho z / 2 + O(z^2).
+
+    Parameters
+    ----------
+    k : array
+        Log-moneyness log(K/F).
+    alpha : float
+        Initial (ATM-like) volatility level, alpha > 0.
+    beta : float
+        CEV exponent in [0, 1]. Fixed by market convention, not fitted:
+        beta = 1 (lognormal) for FX/equity, beta ~ 0.5 for interest rates,
+        beta = 0 (normal) for spread-like underlyings.
+    rho : float
+        Spot/vol correlation, |rho| < 1.
+    nu : float
+        Vol-of-vol, nu >= 0.
+    F : float
+        Forward price of the underlying, F > 0.
+    T : float
+        Time to expiry in years, T > 0.
+
+    Returns
+    -------
+    array
+        Lognormal implied volatilities sigma_B(k).
+    """
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"SABR beta must be in [0, 1], got {beta}")
+    if alpha <= 0:
+        raise ValueError(f"SABR alpha must be positive, got {alpha}")
+    if F <= 0:
+        raise ValueError(f"SABR forward F must be positive, got {F}")
+
+    k = np.asarray(k, dtype=np.float64)
+    one_m_beta = 1.0 - beta
+    L = -k  # log(F/K) = -log(K/F)
+    # (F K)^((1-beta)/2) with K = F e^k  =>  F^(1-beta) e^(k (1-beta)/2)
+    fk_pow = F**one_m_beta * np.exp(0.5 * one_m_beta * k)
+
+    denom_series = (
+        1.0
+        + one_m_beta**2 / 24.0 * L**2
+        + one_m_beta**4 / 1920.0 * L**4
+    )
+
+    z = (nu / alpha) * fk_pow * L
+    sqrt_term = np.sqrt(1.0 - 2.0 * rho * z + z * z)
+    # Guard log argument: positive for |rho| < 1 by construction
+    x_z = np.log((sqrt_term + z - rho) / (1.0 - rho))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z_over_x = np.where(np.abs(z) < 1e-8, 1.0 - 0.5 * rho * z, z / x_z)
+
+    bracket = 1.0 + (
+        one_m_beta**2 * alpha**2 / (24.0 * fk_pow**2)
+        + rho * beta * nu * alpha / (4.0 * fk_pow)
+        + (2.0 - 3.0 * rho**2) * nu**2 / 24.0
+    ) * T
+
+    return alpha / (fk_pow * denom_series) * z_over_x * bracket
+
+
+def sabr_total_variance(
+    k: np.ndarray, alpha: float, beta: float, rho: float, nu: float,
+    F: float, T: float,
+) -> np.ndarray:
+    """SABR total variance w(k) = sigma_B(k)^2 * T via the Hagan expansion.
+
+    See :func:`sabr_implied_vol` for the model and parameter definitions.
+    """
+    sigma = sabr_implied_vol(k, alpha, beta, rho, nu, F, T)
+    return sigma**2 * T
+
+
+def _finite_diff_derivatives(
+    k_grid: np.ndarray, w: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Numerical w'(k), w''(k) on a uniform grid via central differences.
+
+    Used for parametrizations without tractable analytic derivatives
+    (e.g. SABR) when evaluating the butterfly density penalty.
+    """
+    dw = np.gradient(w, k_grid)
+    d2w = np.gradient(dw, k_grid)
+    return dw, d2w
+
+
 def _butterfly_penalty(
     k: np.ndarray, w: np.ndarray, dw: np.ndarray, d2w: np.ndarray
 ) -> float:
@@ -826,4 +937,133 @@ class DirectSVI(Parametrization):
         return directsvi_total_variance(
             k, params["z0"], params["z1"], params["z2"],
             params["z3"], params["z4"], params["z5"],
+        )
+
+
+class SABR(Parametrization):
+    """SABR stochastic volatility model [Hagan et al. 2002].
+
+    dF = α F^β dW₁,  dα = ν α dW₂,  d<W₁,W₂> = ρ dt
+
+    Implied vols come from the Hagan (HKLW) lognormal asymptotic
+    expansion; total variance is w(k) = σ_B(k)² T. The market standard
+    for interest-rate (swaption/cap) and FX volatility smiles.
+
+    β is fixed by market convention (not fitted): 1 for FX/equity,
+    ~0.5 for rates, 0 for normal dynamics. Calibrates (α, ρ, ν) given
+    β, F, T via L-BFGS-B with Nelder-Mead fallback.
+
+    Butterfly-density derivatives are evaluated by finite differences
+    (the Hagan expansion has no tractable closed-form w'', and the
+    expansion itself can violate no-arbitrage for extreme strikes or
+    long maturities — NO_BUTTERFLY is a numerical check, not a
+    structural guarantee).
+    """
+
+    def calibrate(
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
+    ) -> Optional[Dict[str, float]]:
+        """Fit (α, ρ, ν) minimizing MSE(w_model, w_target) for fixed β.
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness log(K/F).
+        w_target : NDArray[np.float64]
+            Market total variances σ_mkt² T.
+        **kwargs
+            Must contain 'T' (years) and 'F' (forward price).
+            Optional 'beta': CEV exponent in [0, 1], default 0.5.
+            Optional 'w_prev': prior slice total variance for calendar arb.
+
+        Returns
+        -------
+        Dict[str, float] or None
+            {'alpha', 'beta', 'rho', 'nu', 'F', 'T'} or None.
+        """
+        T = float(kwargs["T"])
+        F = float(kwargs["F"])
+        beta = float(kwargs.get("beta", 0.5))
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError(f"SABR beta must be in [0, 1], got {beta}")
+        if T <= 0 or F <= 0:
+            raise ValueError(f"SABR requires T > 0 and F > 0, got T={T}, F={F}")
+
+        from scipy.optimize import minimize
+
+        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
+        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
+        need_grid = check_butterfly or check_calendar
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
+        w_prev = kwargs.get("w_prev")
+
+        def objective(params):
+            alpha, rho, nu = params
+            penalty = 0.0
+            if alpha <= 0:
+                penalty += 1e6 * (1 - alpha) ** 2
+                return 1e6 + penalty
+            if abs(rho) >= 0.999:
+                penalty += 1e6 * (abs(rho) - 0.999) ** 2
+                rho = np.clip(rho, -0.998, 0.998)
+            if nu < 0:
+                penalty += 1e6 * nu**2
+                nu = 0.0
+            w_model = sabr_total_variance(k, alpha, beta, rho, nu, F, T)
+            mse = float(np.mean((w_target - w_model) ** 2))
+            if need_grid:
+                w_g = sabr_total_variance(k_grid, alpha, beta, rho, nu, F, T)
+                if check_butterfly:
+                    dw_g, d2w_g = _finite_diff_derivatives(k_grid, w_g)
+                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
+                if check_calendar and w_prev is not None:
+                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
+            return mse + penalty
+
+        # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
+        w_atm = float(np.interp(0.0, k, w_target))
+        sigma_atm = np.sqrt(max(w_atm, 1e-12) / T)
+        alpha0 = sigma_atm * F ** (1.0 - beta)
+        x0 = np.array([max(alpha0, 1e-4), 0.0, 0.5])
+
+        bounds = [
+            (1e-8, None),      # alpha > 0
+            (-0.999, 0.999),   # |rho| < 1
+            (0.0, None),       # nu >= 0
+        ]
+
+        # Tight ftol/gtol: total-variance MSEs are O(1e-8) even mid-fit, so
+        # scipy's default relative ftol would declare convergence too early.
+        res = minimize(
+            objective, x0, method="L-BFGS-B", bounds=bounds,
+            options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+        )
+        if not res.success:
+            res = minimize(
+                objective, x0, method="Nelder-Mead",
+                options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+            )
+            if not res.success:
+                return None
+
+        alpha, rho, nu = res.x
+        if alpha <= 0 or abs(rho) >= 0.999 or nu < 0:
+            return None
+
+        return {
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "rho": float(rho),
+            "nu": float(nu),
+            "F": float(F),
+            "T": float(T),
+        }
+
+    def total_variance(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Evaluate w(k) = σ_B(k)² T via the Hagan expansion."""
+        return sabr_total_variance(
+            k, params["alpha"], params["beta"], params["rho"],
+            params["nu"], params["F"], params["T"],
         )
