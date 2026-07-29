@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/svi-py)](https://pypi.org/project/svi-py/)
 [![Python](https://img.shields.io/pypi/pyversions/svi-py)](https://pypi.org/project/svi-py/)
 [![Downloads](https://static.pepy.tech/badge/svi-py)](https://pepy.tech/project/svi-py)
+[![codecov](https://codecov.io/gh/marwinsteiner/pysvi/branch/main/graph/badge.svg)](https://codecov.io/gh/marwinsteiner/pysvi)
 [![Docs](https://readthedocs.org/projects/pysvi/badge/?version=latest)](https://pysvi.readthedocs.io)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
