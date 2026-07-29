@@ -170,9 +170,23 @@ $$dF = \alpha F^\beta\, dW_1, \qquad d\alpha = \nu\, \alpha\, dW_2, \qquad d\lan
 
 Implied volatilities come from the Hagan et al. asymptotic expansion (the "HKLW formula"):
 
-$$\sigma_B(K, F) = \frac{\alpha}{(FK)^{(1-\beta)/2}\, D(L)} \cdot \frac{z}{x(z)} \cdot \left\{1 + \left[\frac{(1-\beta)^2\alpha^2}{24\,(FK)^{1-\beta}} + \frac{\rho\beta\nu\alpha}{4\,(FK)^{(1-\beta)/2}} + \frac{2-3\rho^2}{24}\nu^2\right] T\right\}$$
+$$\sigma_B(K, F) = \frac{\alpha}{(FK)^{(1-\beta)/2}\, D(L)} \cdot \frac{z}{x(z)} \cdot \left(1 + \left[\frac{(1-\beta)^2\alpha^2}{24\,(FK)^{1-\beta}} + \frac{\rho\beta\nu\alpha}{4\,(FK)^{(1-\beta)/2}} + \frac{2-3\rho^2}{24}\nu^2\right] T\right)$$
 
-where $L = \log(F/K)$, $D(L) = 1 + \frac{(1-\beta)^2}{24}L^2 + \frac{(1-\beta)^4}{1920}L^4$, $z = \frac{\nu}{\alpha}(FK)^{(1-\beta)/2} L$, and $x(z) = \log\!\left[\frac{\sqrt{1-2\rho z+z^2}+z-\rho}{1-\rho}\right]$. At the money $z/x(z) \to 1$ (handled via Taylor expansion). Total variance is then $w(k) = \sigma_B^2(k)\, T$.
+with log-moneyness ratio and wing-correction series
+
+$$L = \log(F/K), \qquad D(L) = 1 + \frac{(1-\beta)^2}{24}L^2 + \frac{(1-\beta)^4}{1920}L^4$$
+
+and the vol-of-vol transform
+
+$$z = \frac{\nu}{\alpha}\,(FK)^{(1-\beta)/2}\, L, \qquad x(z) = \log\left(\frac{\sqrt{1-2\rho z+z^2}+z-\rho}{1-\rho}\right)$$
+
+At the money the singular factor tends to one and is handled via Taylor expansion:
+
+$$\lim_{K \to F}\, \frac{z}{x(z)} = 1$$
+
+Total variance is then
+
+$$w(k) = \sigma_B^2(k)\, T$$
 
 | Parameter | Meaning | Constraint |
 |-----------|---------|------------|
