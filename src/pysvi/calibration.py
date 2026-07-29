@@ -18,7 +18,7 @@ from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
 
-from .models import SVI, SSVI, ESSVI, JumpWings, DirectSVI, Parametrization, ArbitrageFreedom
+from .models import SVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR, Parametrization, ArbitrageFreedom
 
 warnings.filterwarnings("ignore")
 
@@ -428,13 +428,14 @@ def get_model(
     * 'ssvi': Surface SSVI - arbitrage-free across T
     * 'essvi': eSSVI - extended rho(T) parametrization
     * 'directsvi' / 'dsvi': Direct algebraic SVI (Schadner) - 6 conic coefficients
+    * 'sabr': SABR (Hagan et al. 2002) - stochastic vol model for rates/FX smiles
 
     Case-insensitive. Extensible: add to dict.
 
     Parameters
     ----------
     model_name : str
-        'svi', 'ssvi', 'essvi', 'directsvi', 'dsvi'.
+        'svi', 'ssvi', 'essvi', 'jumpwings', 'jw', 'directsvi', 'dsvi', 'sabr'.
     arbitrage_condition : ArbitrageFreedom, default QUASI
         Arbitrage constraints to enforce during calibration.
 
@@ -461,5 +462,6 @@ def get_model(
         "jw": JumpWings,
         "directsvi": DirectSVI,
         "dsvi": DirectSVI,
+        "sabr": SABR,
     }
     return models[model_name.lower()](arbitrage_condition=arbitrage_condition)
