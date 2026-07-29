@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 
 # src/pysvi absolute imports (tests/ and src/ siblings)
 from src.pysvi.models import (
-    SVI, SSVI, ESSVI, JumpWings, DirectSVI,
+    SVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
     svi_total_variance
 )
 from src.pysvi.calibration import (
@@ -137,6 +137,22 @@ def jw_calibrated(atm_slice) -> Tuple[JumpWings, pd.DataFrame, Dict[str, float]]
     assert params["v_tilde_t"] > 0
     assert params["p_t"] >= 0
     assert params["c_t"] >= 0
+    return model, df_slice, params
+
+
+@pytest.fixture
+def sabr_calibrated(atm_slice) -> Tuple[SABR, pd.DataFrame, Dict[str, float]]:
+    """SABR + slice + guaranteed calibration (beta=1, equity-style slice)."""
+    df_slice = atm_slice
+    model = cast(SABR, get_model("sabr"))
+    T = float(df_slice["maturity"].iloc[0])
+    F = float(df_slice["implied_forward"].iloc[0])
+    params = calibrate_slice(df_slice, model, T=T, F=F, beta=1.0)
+    assert params is not None
+    assert params["alpha"] > 0
+    assert abs(params["rho"]) < 0.999
+    assert params["nu"] >= 0
+    assert params["beta"] == 1.0
     return model, df_slice, params
 
 
