@@ -1,7 +1,7 @@
 [project]
 name = "svi-py"
 dynamic = ["version"]
-description = "Stochastic volatility inspired parametrizations of the implied volatility surface in Python!"
+description = "Stochastic volatility inspired (SVI) parametrizations of the implied volatility surface, plus the SABR model, in Python!"
 authors = [{name = "Marwin Steiner"}]
 license = {text = "MIT"}
 readme = "README.md"

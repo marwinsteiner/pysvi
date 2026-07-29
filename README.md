@@ -1,8 +1,8 @@
 # svi-py
 
-Stochastic volatility inspired (SVI) parametrizations of the implied volatility surface in Python.
+Stochastic volatility inspired (SVI) parametrizations of the implied volatility surface in Python — plus the SABR stochastic volatility model.
 
-Given a panel of contemporaneous European call and put option prices across strikes and maturities, `svi-py` calibrates smooth, arbitrage-aware total variance surfaces using the SVI family of models. It handles the full pipeline: implied vol extraction, forward estimation via put-call parity, OTM leg selection, and per-slice calibration with configurable no-arbitrage constraints.
+Given a panel of contemporaneous European call and put option prices across strikes and maturities, `svi-py` calibrates smooth, arbitrage-aware total variance surfaces using the SVI family of models and SABR. It handles the full pipeline: implied vol extraction, forward estimation via put-call parity, OTM leg selection, and per-slice calibration with configurable no-arbitrage constraints.
 
 ## Installation
 
@@ -52,6 +52,15 @@ DirectSVI requires no extra arguments — it fits directly from log-moneyness an
 ```python
 model = get_model("dsvi")
 params = calibrate_slice(df_slice, model)
+```
+
+For SABR, pass the time to expiry and the forward, and optionally fix the CEV exponent β (default 0.5):
+
+```python
+model = get_model("sabr")
+T = float(df_slice["maturity"].iloc[0])
+F = float(df_slice["implied_forward"].iloc[0])
+params = calibrate_slice(df_slice, model, T=T, F=F, beta=1.0)  # beta=1 for FX/equity
 ```
 
 ### Where do the inputs come from?
@@ -153,6 +162,36 @@ $$\sigma = |\alpha \cdot m|, \quad a = \tilde{v}_t \cdot T - b\,\sigma\sqrt{1 - 
 
 Same 5 degrees of freedom as raw SVI but with parameters that have direct market interpretation (wing slopes, ATM level, minimum variance).
 
+### SABR
+
+The SABR stochastic volatility model (Hagan, Kumar, Lesniewski & Woodward 2002) — the market standard for interest-rate (swaptions, caps/floors) and FX volatility smiles. Unlike the SVI family, SABR is a *dynamic model*: it specifies stochastic differential equations for the forward and its volatility,
+
+$$dF = \alpha F^\beta\, dW_1, \qquad d\alpha = \nu\, \alpha\, dW_2, \qquad d\langle W_1, W_2\rangle = \rho\, dt$$
+
+Implied volatilities come from the Hagan et al. asymptotic expansion (the "HKLW formula"):
+
+$$\sigma_B(K, F) = \frac{\alpha}{(FK)^{(1-\beta)/2}\, D(L)} \cdot \frac{z}{x(z)} \cdot \left\{1 + \left[\frac{(1-\beta)^2\alpha^2}{24\,(FK)^{1-\beta}} + \frac{\rho\beta\nu\alpha}{4\,(FK)^{(1-\beta)/2}} + \frac{2-3\rho^2}{24}\nu^2\right] T\right\}$$
+
+where $L = \log(F/K)$, $D(L) = 1 + \frac{(1-\beta)^2}{24}L^2 + \frac{(1-\beta)^4}{1920}L^4$, $z = \frac{\nu}{\alpha}(FK)^{(1-\beta)/2} L$, and $x(z) = \log\!\left[\frac{\sqrt{1-2\rho z+z^2}+z-\rho}{1-\rho}\right]$. At the money $z/x(z) \to 1$ (handled via Taylor expansion). Total variance is then $w(k) = \sigma_B^2(k)\, T$.
+
+| Parameter | Meaning | Constraint |
+|-----------|---------|------------|
+| $\alpha$ | initial volatility level | $\alpha > 0$ |
+| $\beta$ | CEV exponent (**fixed**, not fitted) | $0 \leq \beta \leq 1$ |
+| $\rho$ | spot/vol correlation | $\|\rho\| < 1$ |
+| $\nu$ | vol-of-vol | $\nu \geq 0$ |
+
+Following market practice, $\beta$ is fixed by convention rather than calibrated: $\beta = 1$ (lognormal) for FX and equity, $\beta \approx 0.5$ for interest rates, $\beta = 0$ (normal) for spread-like underlyings. Calibration fits $(\alpha, \rho, \nu)$ per slice given $\beta$, $F$, $T$:
+
+```python
+model = get_model("sabr")
+params = calibrate_slice(df_slice, model, T=T, F=F, beta=0.5)
+```
+
+> **Note:** the HKLW expansion is accurate near the money and for moderate maturities, but is known to lose accuracy (and can even imply negative densities) for deep wings or very long maturities. `NO_BUTTERFLY` performs a numerical density check via finite differences — it is a guard, not a structural guarantee.
+
+**Reference:** Hagan, P., Kumar, D., Lesniewski, A., Woodward, D. (2002). "Managing Smile Risk", *Wilmott Magazine*.
+
 ## Arbitrage freeness
 
 Every parametrization accepts an `arbitrage_condition` argument controlling how strictly no-arbitrage is enforced during calibration. The options are flags that can be combined with `|`:
@@ -205,7 +244,7 @@ All models calibrate via L-BFGS-B (bounded quasi-Newton) with automatic Nelder-M
 2. **`model.calibrate`**: minimises MSE$(w_{\text{model}}, w_{\text{target}})$ plus penalty terms.
 3. **`apply_slice`**: evaluates the fitted surface, computes $\sigma_{\text{fit}} = \sqrt{w/T}$ and residuals.
 
-The factory function `get_model(name)` accepts `"svi"`, `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), and `"directsvi"` (or `"dsvi"`).
+The factory function `get_model(name)` accepts `"svi"`, `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), `"directsvi"` (or `"dsvi"`), and `"sabr"`.
 
 ## Contributing
 
