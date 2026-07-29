@@ -127,8 +127,10 @@ def calculate_implied_forward(
 ) -> pd.Series:
     """Compute forward price F from put-call parity on same strike slice.
 
-    PCP: C - P = e^(-rT) * (F - K)
-    → F = K + e^(rT) * (C - P)
+    ::
+
+        PCP: C - P = e^(-rT) * (F - K)
+        →    F = K + e^(rT) * (C - P)
 
     Parameters
     ----------

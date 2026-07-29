@@ -69,7 +69,8 @@ def jw_total_variance(
 ) -> np.ndarray:
     """Jump-wings SVI total variance w(k; T).
 
-    The jump-wings parametrization [Gatheral 2004] converts to raw SVI via:
+    The jump-wings parametrization [Gatheral 2004] converts to raw SVI via::
+
         b = (p_t + c_t) / 2
         rho = 1 - p_t / b   (equivalently (c_t - p_t) / (c_t + p_t))
         beta = rho - 2 * psi_t * sqrt(T) / b
@@ -127,25 +128,29 @@ def sabr_implied_vol(
     """SABR lognormal (Black) implied volatility via Hagan et al. (2002).
 
     The SABR model [Hagan, Kumar, Lesniewski, Woodward 2002] assumes
-    forward dynamics
+    forward dynamics::
 
         dF = alpha * F^beta dW1,   d(alpha) = nu * alpha dW2,
         d<W1, W2> = rho dt
 
-    and admits the asymptotic implied-vol expansion (HKLW formula)
+    and admits the asymptotic implied-vol expansion (HKLW formula)::
 
         sigma_B(K, F) = alpha / [(FK)^((1-beta)/2) * D(L)] * (z / x(z))
                         * {1 + [ (1-beta)^2 alpha^2 / (24 (FK)^(1-beta))
                                + rho beta nu alpha / (4 (FK)^((1-beta)/2))
                                + (2 - 3 rho^2) nu^2 / 24 ] T}
 
-    where L = log(F/K),
-        D(L) = 1 + (1-beta)^2/24 L^2 + (1-beta)^4/1920 L^4,
-        z    = (nu/alpha) (FK)^((1-beta)/2) L,
-        x(z) = log[(sqrt(1 - 2 rho z + z^2) + z - rho) / (1 - rho)].
+    where::
+
+        L    = log(F/K)
+        D(L) = 1 + (1-beta)^2/24 L^2 + (1-beta)^4/1920 L^4
+        z    = (nu/alpha) (FK)^((1-beta)/2) L
+        x(z) = log[(sqrt(1 - 2 rho z + z^2) + z - rho) / (1 - rho)]
 
     At the money z -> 0 and z/x(z) -> 1; the singularity is handled via
     the Taylor expansion z/x(z) = 1 - rho z / 2 + O(z^2).
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/sabr.html
 
     Parameters
     ----------
@@ -357,15 +362,20 @@ class Parametrization(ABC):
 class SVI(Parametrization):
     """Raw SVI total variance parametrization [Gatheral 2004].
 
-    w(k) = a + b {ρ(k-m) + sqrt[(k-m)² + σ²]}
+    ::
+
+        w(k) = a + b {ρ(k-m) + sqrt[(k-m)² + σ²]}
 
     No-arbitrage constraints softly enforced via bounds/penalties:
+
     * b > 0 (positive slope)
     * abs(ρ) < 1 (correlation)
     * σ > 0 (vol of vol)
 
     Calibrates via L-BFGS-B (bounded) → Nelder-Mead fallback.
     Initial guess: ATM a, median m, wing-informed b/σ.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/svi.html
     """
 
     def calibrate(
@@ -460,13 +470,17 @@ class SVI(Parametrization):
 class SSVI(Parametrization):
     """Surface-consistent SSVI [Gatheral & Jacquier 2014].
 
-    w(k;θ) = θ/2 [1 + ρ φ(θ) k + sqrt{(φ(θ) k + ρ)² + (1-ρ²)}]
+    ::
 
-    θ = ATM total variance (fixed per slice, typically σ_ATM² T)
-    φ(θ) = η / sqrt(θ) - curvature scale independent of ATM level
+        w(k;θ) = θ/2 [1 + ρ φ(θ) k + sqrt{(φ(θ) k + ρ)² + (1-ρ²)}]
+
+        θ    = ATM total variance (fixed per slice, typically σ_ATM² T)
+        φ(θ) = η / sqrt(θ) - curvature scale independent of ATM level
 
     Guarantees no butterfly arbitrage across strikes for fixed θ.
     Calibrates only ρ, η (2 params) given θ.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/ssvi.html
     """
 
     def calibrate(
@@ -542,13 +556,17 @@ class SSVI(Parametrization):
 class ESSVI(Parametrization):
     """Extended SSVI with ρ(θ) parametrization.
 
-    w(k;θ) = θ/2 [1 + ρ(θ) φ(θ) k + sqrt{(φ(θ) k + ρ(θ))² + (1-ρ(θ)²)}]
+    ::
 
-    ρ(θ) = clip(ρ₀ + ρ₁ (θ/θ_ref)^α, -0.999, 0.999)  ← term structure skew
-    φ(θ) = η / sqrt(θ)                                ← curvature
+        w(k;θ) = θ/2 [1 + ρ(θ) φ(θ) k + sqrt{(φ(θ) k + ρ(θ))² + (1-ρ(θ)²)}]
+
+        ρ(θ) = clip(ρ₀ + ρ₁ (θ/θ_ref)^α, -0.999, 0.999)  ← term structure skew
+        φ(θ) = η / sqrt(θ)                                ← curvature
 
     θ_ref smooths ρ across maturities (often median ATM θ). 4 params total.
     Enables realistic calendar skew evolution.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/essvi.html
     """
 
     def calibrate(
@@ -651,7 +669,8 @@ class ESSVI(Parametrization):
 class JumpWings(Parametrization):
     """SVI jump-wings parametrization [Gatheral 2004].
 
-    Parameters are (v_t, psi_t, p_t, c_t, v_tilde_t) per slice at maturity T:
+    Parameters are (v_t, psi_t, p_t, c_t, v_tilde_t) per slice at maturity T::
+
       v_t       : ATM variance sigma_ATM^2
       psi_t     : ATM skew (dw/dk at k=0) / (2T)
       p_t       : left (put) wing slope,  p_t >= 0
@@ -660,6 +679,8 @@ class JumpWings(Parametrization):
 
     Internally converts to raw SVI (a, b, rho, m, sigma) for evaluation.
     Calibrates 5 jump-wings params via L-BFGS-B with Nelder-Mead fallback.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/jumpwings.html
     """
 
     def calibrate(
@@ -772,7 +793,7 @@ def directsvi_fit(
 ) -> NDArray[np.float64]:
     """Direct algebraic SVI fit via conic section eigenvalue problem.
 
-    Linearises the SVI equation as a hyperbola in (x, y) = (k, w) space:
+    Linearises the SVI equation as a hyperbola in (x, y) = (k, w) space::
 
         z₀x² + z₁y² + z₂xy + z₃x + z₄y + z₅ = 0
 
@@ -848,7 +869,7 @@ def directsvi_total_variance(
     """Evaluate the DirectSVI conic for given log-moneyness.
 
     Solves the conic z₀x² + z₁y² + z₂xy + z₃x + z₄y + z₅ = 0 for y
-    via the quadratic formula:
+    via the quadratic formula::
 
         y = (−(z₂x + z₄) + √((z₂x + z₄)² − 4z₁(z₀x² + z₃x + z₅))) / (2z₁)
 
@@ -885,7 +906,7 @@ def directsvi_total_variance(
 class DirectSVI(Parametrization):
     """Direct algebraic SVI fit via conic section [Schadner].
 
-    Linearises the SVI total variance curve as a hyperbola:
+    Linearises the SVI total variance curve as a hyperbola::
 
         z₀k² + z₁w² + z₂kw + z₃k + z₄w + z₅ = 0
 
@@ -895,6 +916,8 @@ class DirectSVI(Parametrization):
     The direct fit is fast and robust but does not support penalty-based
     arbitrage enforcement (NO_BUTTERFLY / NO_CALENDAR). Only
     ArbitrageFreedom.QUASI is meaningful.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/directsvi.html
     """
 
     def calibrate(
@@ -943,7 +966,9 @@ class DirectSVI(Parametrization):
 class SABR(Parametrization):
     """SABR stochastic volatility model [Hagan et al. 2002].
 
-    dF = α F^β dW₁,  dα = ν α dW₂,  d<W₁,W₂> = ρ dt
+    ::
+
+        dF = α F^β dW₁,  dα = ν α dW₂,  d<W₁,W₂> = ρ dt
 
     Implied vols come from the Hagan (HKLW) lognormal asymptotic
     expansion; total variance is w(k) = σ_B(k)² T. The market standard
@@ -958,6 +983,8 @@ class SABR(Parametrization):
     expansion itself can violate no-arbitrage for extreme strikes or
     long maturities — NO_BUTTERFLY is a numerical check, not a
     structural guarantee).
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/sabr.html
     """
 
     def calibrate(
