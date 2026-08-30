@@ -10,6 +10,7 @@ Given a panel of contemporaneous European call and put option prices across stri
 - **Configurable no-arbitrage enforcement**: butterfly (density) and calendar-spread penalties, combinable as flags
 - **Full data pipeline**: BSM implied vols from prices, implied forwards from put-call parity, OTM leg selection, slice preparation
 - **Robust calibration**: L-BFGS-B with automatic Nelder-Mead fallback; closed-form fitting for DirectSVI
+- **Optional numba acceleration**: JIT-compiled kernels behind a runtime toggle (`pip install "svi-py[numba]"`), 2-6x faster arbitrage-constrained calibration
 
 ## Installation
 

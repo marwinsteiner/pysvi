@@ -20,7 +20,11 @@ Stochastic volatility inspired (SVI) parametrizations of the implied volatility 
 pip install svi-py
 ```
 
-Requires Python >= 3.13.
+Requires Python >= 3.13. For JIT-accelerated calibration (togglable at runtime via `pysvi.use_numba`), install the numba extra:
+
+```bash
+pip install "svi-py[numba]"
+```
 
 ## Quick start
 

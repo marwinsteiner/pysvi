@@ -65,6 +65,27 @@ params = calibrate_slice(df_slice, model, T=T, F=F, beta=1.0)  # beta=1 for FX/e
 
 See {doc}`models/index` for the full catalogue and when to use which model.
 
+## Numba acceleration
+
+Calibration hot paths have JIT-compiled twins. Install the optional extra:
+
+```bash
+pip install "svi-py[numba]"
+```
+
+When numba is installed the accelerated backend is on automatically — no code
+changes needed. Toggle it at runtime with `pysvi.use_numba(False)` /
+`pysvi.use_numba(True)`, or disable it at import time with the environment
+variable `PYSVI_NUMBA=0`. Both backends produce the same results to within
+floating-point rounding.
+
+Expect roughly 2-6x faster calibration when grid-based arbitrage penalties
+are active (`NO_BUTTERFLY` / `NO_CALENDAR`), with the largest gains for SABR;
+unconstrained (`QUASI`) fits on small slices are dominated by optimizer
+overhead, so gains there are modest. Kernels compile on first use in each
+process (a few seconds); measure your own workload with
+`python scripts/bench_numba.py`.
+
 ## Where do the inputs come from?
 
 `svi-py` expects you to already have implied volatilities and forward prices. If you're starting from raw option prices, the library provides helpers:

@@ -16,6 +16,9 @@ dependencies = [
     "twine>=6.2.0",
 ]
 
+[project.optional-dependencies]
+numba = ["numba>=0.67"]
+
 [project.urls]
 Documentation = "https://pysvi.readthedocs.io"
 Repository = "https://github.com/marwinsteiner/pysvi"
