@@ -1,17 +1,48 @@
 # src/pysvi/models.py
 """
 Core parametrizations for stochastic volatility inspired IV surfaces.
-Pure NumPy/Numba functions for SVI, SSVI, eSSVI total variance.
+NumPy implementations with optional numba acceleration (see use_numba).
 Extensible via Parametrization ABC.
 """
 
-# import numba as nb
 import numpy as np
 from abc import ABC, abstractmethod
 from enum import Flag, auto
 from typing import Dict, Optional
 from numpy.typing import NDArray
 from loguru import logger
+
+from . import _kernels
+
+
+def numba_available() -> bool:
+    """True if the optional numba dependency is installed.
+
+    Install it with ``pip install "svi-py[numba]"``.
+    """
+    return _kernels.numba_available()
+
+
+def use_numba(enabled: bool = True) -> None:
+    """Toggle the numba-accelerated kernels at runtime.
+
+    The numba backend is enabled automatically when numba is installed
+    (disable at import time with the environment variable
+    ``PYSVI_NUMBA=0``). All kernels have a pure-NumPy twin, so toggling
+    changes speed, not results — outputs agree to within floating-point
+    rounding (jitted kernels use fastmath).
+
+    Parameters
+    ----------
+    enabled : bool, default True
+        True activates jitted kernels; False falls back to pure NumPy.
+
+    Raises
+    ------
+    ImportError
+        If enabling is requested but numba is not installed.
+    """
+    _kernels.use_numba(enabled)
 
 
 class ArbitrageFreedom(Flag):
@@ -34,34 +65,30 @@ class ArbitrageFreedom(Flag):
     NO_CALENDAR = auto()
 
 
-# @nb.njit(fastmath=True)
+def _as_f64(k) -> NDArray[np.float64]:
+    """Cast log-moneyness input to a float64 array for kernel dispatch."""
+    return np.asarray(k, dtype=np.float64)
+
+
 def svi_total_variance(
     k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float
 ) -> np.ndarray:
     """Raw SVI total variance w(k)."""
-    z = k - m
-    return a + b * (rho * z + np.sqrt(z * z + sigma * sigma))
+    return _kernels.resolve("svi_w")(_as_f64(k), a, b, rho, m, sigma)
 
 
-# @nb.njit(fastmath=True)
 def ssvi_total_variance(
     k: np.ndarray, theta: float, rho: float, phi_theta: float
 ) -> np.ndarray:
     """SSVI total variance w(k)."""
-    term1 = 1.0 + rho * phi_theta * k
-    term2 = np.sqrt((phi_theta * k + rho) ** 2 + (1.0 - rho**2))
-    return 0.5 * theta * (term1 + term2)
+    return _kernels.resolve("ssvi_w")(_as_f64(k), theta, rho, phi_theta)
 
 
-# @nb.njit(fastmath=True)
 def essvi_total_variance(
     k: np.ndarray, theta: float, rho_theta: float, phi_theta: float
 ) -> np.ndarray:
     """eSSVI total variance w(k)."""
-    inside = (phi_theta * k + rho_theta) ** 2 + (1.0 - rho_theta**2)
-    term1 = 1.0 + rho_theta * phi_theta * k
-    term2 = np.sqrt(inside)
-    return 0.5 * theta * (term1 + term2)
+    return _kernels.resolve("essvi_w")(_as_f64(k), theta, rho_theta, phi_theta)
 
 
 def jw_total_variance(
@@ -101,24 +128,7 @@ def jw_total_variance(
     array
         Total variance w(k) = sigma^2(k) * T.
     """
-    b = (p_t + c_t) / 2.0
-    if b < 1e-12:
-        return np.full_like(k, v_t * T, dtype=np.float64)
-    rho = 1.0 - p_t / b
-    beta = rho - 2.0 * psi_t * np.sqrt(T) / b
-    beta = np.clip(beta, -0.9999, 0.9999)
-    if abs(beta) < 1e-12:
-        alpha = 0.0
-    else:
-        alpha = np.sign(beta) * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
-    denom = -rho + np.sign(alpha) * np.sqrt(1.0 + alpha * alpha) - alpha * np.sqrt(1.0 - rho * rho)
-    if abs(denom) < 1e-12:
-        m = 0.0
-    else:
-        m = (v_t - v_tilde_t) * T / (b * denom)
-    sigma = max(abs(alpha * m), 1e-12)
-    a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho * rho)
-    return svi_total_variance(k, a, b, rho, m, sigma)
+    return _kernels.resolve("jw_w")(_as_f64(k), v_t, psi_t, p_t, c_t, v_tilde_t, T)
 
 
 def sabr_implied_vol(
@@ -183,32 +193,7 @@ def sabr_implied_vol(
     if F <= 0:
         raise ValueError(f"SABR forward F must be positive, got {F}")
 
-    k = np.asarray(k, dtype=np.float64)
-    one_m_beta = 1.0 - beta
-    L = -k  # log(F/K) = -log(K/F)
-    # (F K)^((1-beta)/2) with K = F e^k  =>  F^(1-beta) e^(k (1-beta)/2)
-    fk_pow = F**one_m_beta * np.exp(0.5 * one_m_beta * k)
-
-    denom_series = (
-        1.0
-        + one_m_beta**2 / 24.0 * L**2
-        + one_m_beta**4 / 1920.0 * L**4
-    )
-
-    z = (nu / alpha) * fk_pow * L
-    sqrt_term = np.sqrt(1.0 - 2.0 * rho * z + z * z)
-    # Guard log argument: positive for |rho| < 1 by construction
-    x_z = np.log((sqrt_term + z - rho) / (1.0 - rho))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        z_over_x = np.where(np.abs(z) < 1e-8, 1.0 - 0.5 * rho * z, z / x_z)
-
-    bracket = 1.0 + (
-        one_m_beta**2 * alpha**2 / (24.0 * fk_pow**2)
-        + rho * beta * nu * alpha / (4.0 * fk_pow)
-        + (2.0 - 3.0 * rho**2) * nu**2 / 24.0
-    ) * T
-
-    return alpha / (fk_pow * denom_series) * z_over_x * bracket
+    return _kernels.resolve("sabr_vol")(_as_f64(k), alpha, beta, rho, nu, F, T)
 
 
 def sabr_total_variance(
@@ -230,10 +215,9 @@ def _finite_diff_derivatives(
 
     Used for parametrizations without tractable analytic derivatives
     (e.g. SABR) when evaluating the butterfly density penalty.
+    Central differences in the interior, one-sided at the edges.
     """
-    dw = np.gradient(w, k_grid)
-    d2w = np.gradient(dw, k_grid)
-    return dw, d2w
+    return _kernels.resolve("finite_diff")(_as_f64(k_grid), _as_f64(w))
 
 
 def _butterfly_penalty(
@@ -248,33 +232,21 @@ def _butterfly_penalty(
     Butterfly arbitrage is absent iff g(k) >= 0 for all k.
     Returns a penalty proportional to the integral of max(-g, 0).
     """
-    g = (1.0 - k * dw / (2.0 * w)) ** 2 - (dw**2) / 4.0 * (1.0 / w + 0.25) + d2w / 2.0
-    violations = np.maximum(-g, 0.0)
-    return float(np.sum(violations**2))
+    return float(_kernels.resolve("butterfly")(k, w, dw, d2w))
 
 
 def _svi_derivatives(
     k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute w, w', w'' for raw SVI parametrization."""
-    z = k - m
-    r = np.sqrt(z * z + sigma * sigma)
-    w = a + b * (rho * z + r)
-    dw = b * (rho + z / r)
-    d2w = b * sigma**2 / r**3
-    return w, dw, d2w
+    return _kernels.resolve("svi_derivs")(k, a, b, rho, m, sigma)
 
 
 def _ssvi_derivatives(
     k: np.ndarray, theta: float, rho: float, phi: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute w, w', w'' for SSVI/eSSVI parametrization."""
-    u = phi * k + rho
-    disc = np.sqrt(u**2 + 1.0 - rho**2)
-    w = 0.5 * theta * (1.0 + rho * phi * k + disc)
-    dw = 0.5 * theta * phi * (rho + u / disc)
-    d2w = 0.5 * theta * phi**2 * (1.0 - rho**2) / disc**3
-    return w, dw, d2w
+    return _kernels.resolve("ssvi_derivs")(k, theta, rho, phi)
 
 
 def _calendar_penalty(
@@ -297,9 +269,28 @@ def _calendar_penalty(
 
     Returns sum-of-squares of violations.
     """
-    diff = w_prev - w_current  # positive where calendar arb exists
-    violations = np.maximum(diff, 0.0)
-    return float(np.sum(violations**2))
+    return float(_kernels.resolve("calendar")(w_current, w_prev))
+
+
+def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
+    """Common calibration setup for the fused objective kernels.
+
+    Casts inputs to float64, builds the penalty evaluation grid (empty when
+    no grid-based constraint is active), and unpacks the arbitrage flags and
+    optional prior-slice total variance into kernel-friendly values.
+    """
+    k = np.asarray(k, dtype=np.float64)
+    w_target = np.asarray(w_target, dtype=np.float64)
+    check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in arbitrage_condition
+    check_calendar = ArbitrageFreedom.NO_CALENDAR in arbitrage_condition
+    if check_butterfly or check_calendar:
+        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+    else:
+        k_grid = np.empty(0)
+    w_prev = kwargs.get("w_prev")
+    has_prev = w_prev is not None
+    w_prev_arr = np.asarray(w_prev, dtype=np.float64) if has_prev else np.empty(0)
+    return k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar
 
 
 class Parametrization(ABC):
@@ -397,31 +388,16 @@ class SVI(Parametrization):
         """
         from scipy.optimize import minimize
 
-        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
-        need_grid = check_butterfly or check_calendar
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
-        w_prev = kwargs.get("w_prev")
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        core = _kernels.resolve("svi_obj")
 
         def objective(params):
-            a, b, rho, m, sigma = params
-            penalty = 0.0
-            if b <= 0:
-                penalty += 1e6 * (1 - b) ** 2
-            if abs(rho) >= 0.999:
-                penalty += 1e6 * (abs(rho) - 0.999) ** 2
-            if sigma <= 0:
-                penalty += 1e6 * (1 - sigma) ** 2
-            w_model = svi_total_variance(k, a, b, rho, m, sigma)
-            mse = float(np.mean((w_target - w_model) ** 2))
-            if need_grid and b > 0 and sigma > 0:
-                w_g = svi_total_variance(k_grid, a, b, rho, m, sigma)
-                if check_butterfly:
-                    _, dw_g, d2w_g = _svi_derivatives(k_grid, a, b, rho, m, sigma)
-                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
-                if check_calendar and w_prev is not None:
-                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
-            return mse + penalty
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+            )
 
         a0 = float(np.nanmin(w_target))
         spread = float(np.nanmax(w_target) - a0)
@@ -502,40 +478,26 @@ class SSVI(Parametrization):
         Dict[str, float] or None
             {'rho', 'eta', 'theta'} or None.
         """
-        theta = kwargs["theta"]
+        theta = float(kwargs["theta"])
         from scipy.optimize import minimize
 
-        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
-        need_grid = check_butterfly or check_calendar
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
-        w_prev = kwargs.get("w_prev")
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        core = _kernels.resolve("ssvi_obj")
 
-        def objective(params, k, w_target, theta):
-            rho, eta = params
-            penalty = 0.0
-            if abs(rho) >= 0.999:
-                penalty += 1e6 * (abs(rho) - 0.999) ** 2
-            if eta <= 0:
-                penalty += 1e6 * (1 - eta) ** 2
-            phi_theta = eta / np.sqrt(theta)
-            w_model = ssvi_total_variance(k, theta, rho, phi_theta)
-            mse = float(np.mean((w_target - w_model) ** 2))
-            if need_grid and eta > 0:
-                w_g = ssvi_total_variance(k_grid, theta, rho, phi_theta)
-                if check_butterfly:
-                    _, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho, phi_theta)
-                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
-                if check_calendar and w_prev is not None:
-                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
-            return mse + penalty
+        def objective(params):
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target, theta,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+            )
 
         x0 = np.array([0.0, 1.0])
         bounds = [(-0.999, 0.999), (1e-8, None)]
 
-        res = minimize(objective, x0, args=(k, w_target, float(theta)), method="L-BFGS-B", bounds=bounds)
+        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
         if not res.success:
-            res = minimize(objective, x0, args=(k, w_target, float(theta)), method="Nelder-Mead")
+            res = minimize(objective, x0, method="Nelder-Mead")
             if not res.success:
                 return None
 
@@ -591,46 +553,32 @@ class ESSVI(Parametrization):
         Dict[str, float] or None
             All params + computed 'rho_theta'.
         """
-        theta = kwargs["theta"]
+        theta = float(kwargs["theta"])
         theta_ref = kwargs["theta_ref"]
 
         from scipy.optimize import minimize
 
         if theta_ref is None:
             theta_ref = theta
+        theta_ref = float(theta_ref)
 
-        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
-        need_grid = check_butterfly or check_calendar
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
-        w_prev = kwargs.get("w_prev")
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        core = _kernels.resolve("essvi_obj")
 
-        def objective(params, k, w_target, theta, theta_ref):
-            rho0, rho1, alpha, eta = params
-            penalty = 0.0
-            if eta <= 0:
-                penalty += 1e6 * (1 - eta) ** 2
-            theta_ratio = theta / max(theta_ref, 1e-12)
-            rho_theta = np.clip(rho0 + rho1 * (theta_ratio**alpha), -0.999, 0.999)
-            phi_theta = eta / np.sqrt(theta)
-            w_model = essvi_total_variance(k, theta, rho_theta, phi_theta)
-            mse = float(np.mean((w_target - w_model) ** 2))
-            penalty += 1e2 * max(0.0, abs(rho_theta) - 0.95)
-            if need_grid and eta > 0:
-                w_g = essvi_total_variance(k_grid, theta, rho_theta, phi_theta)
-                if check_butterfly:
-                    _, dw_g, d2w_g = _ssvi_derivatives(k_grid, theta, rho_theta, phi_theta)
-                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
-                if check_calendar and w_prev is not None:
-                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
-            return mse + penalty
+        def objective(params):
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target, theta, theta_ref,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+            )
 
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
         bounds = [(-0.999, 0.999), (-2.0, 2.0), (-2.0, 2.0), (1e-8, None)]
 
-        res = minimize(objective, x0, args=(k, w_target, float(theta), float(theta_ref)), method="L-BFGS-B", bounds=bounds)
+        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
         if not res.success:
-            res = minimize(objective, x0, args=(k, w_target, float(theta), float(theta_ref)), method="Nelder-Mead")
+            res = minimize(objective, x0, method="Nelder-Mead")
             if not res.success:
                 return None
 
@@ -703,48 +651,19 @@ class JumpWings(Parametrization):
         Dict[str, float] or None
             {'v_t', 'psi_t', 'p_t', 'c_t', 'v_tilde_t', 'T'} or None.
         """
-        T = kwargs["T"]
+        T = float(kwargs["T"])
         from scipy.optimize import minimize
 
-        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
-        need_grid = check_butterfly or check_calendar
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
-        w_prev = kwargs.get("w_prev")
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        core = _kernels.resolve("jw_obj")
 
         def objective(params):
-            v_t, psi_t, p_t, c_t, v_tilde_t = params
-            penalty = 0.0
-            if p_t < 0:
-                penalty += 1e6 * p_t**2
-            if c_t < 0:
-                penalty += 1e6 * c_t**2
-            if v_tilde_t <= 0:
-                penalty += 1e6 * (1 - v_tilde_t) ** 2
-            if v_t <= 0:
-                penalty += 1e6 * (1 - v_t) ** 2
-            if v_tilde_t > v_t:
-                penalty += 1e4 * (v_tilde_t - v_t) ** 2
-            w_model = jw_total_variance(k, v_t, psi_t, p_t, c_t, v_tilde_t, T)
-            mse = float(np.mean((w_target - w_model) ** 2))
-            if need_grid and v_t > 0 and v_tilde_t > 0 and p_t >= 0 and c_t >= 0:
-                w_g = jw_total_variance(k_grid, v_t, psi_t, p_t, c_t, v_tilde_t, T)
-                if check_butterfly:
-                    b = (p_t + c_t) / 2.0
-                    if b > 1e-12:
-                        rho = 1.0 - p_t / b
-                        beta = rho - 2.0 * psi_t * np.sqrt(T) / b
-                        beta = np.clip(beta, -0.9999, 0.9999)
-                        alpha_jw = np.sign(beta) * np.sqrt(max(1.0 / (beta**2) - 1.0, 0.0))
-                        denom = -rho + np.sign(alpha_jw) * np.sqrt(1.0 + alpha_jw**2) - alpha_jw * np.sqrt(1.0 - rho**2)
-                        m = (v_t - v_tilde_t) * T / (b * denom) if abs(denom) > 1e-12 else 0.0
-                        sigma = max(abs(alpha_jw * m), 1e-12)
-                        a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho**2)
-                        _, dw_g, d2w_g = _svi_derivatives(k_grid, a, b, rho, m, sigma)
-                        penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
-                if check_calendar and w_prev is not None:
-                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
-            return mse + penalty
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target, T,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+            )
 
         # Initial guess from market data
         v_t0 = float(np.interp(0.0, k, w_target)) / T if T > 0 else 0.04
@@ -887,20 +806,7 @@ def directsvi_total_variance(
     array
         Total variance w(k).
     """
-    x = np.asarray(k, dtype=np.float64)
-    A = z1
-    B = z2 * x + z4
-    C = z0 * x**2 + z3 * x + z5
-
-    discriminant = B**2 - 4.0 * A * C
-    discriminant = np.maximum(discriminant, 0.0)
-
-    y1 = (-B + np.sqrt(discriminant)) / (2.0 * A)
-    y2 = (-B - np.sqrt(discriminant)) / (2.0 * A)
-
-    # Choose the non-negative root; prefer y1, fall back to y2
-    y = np.where(y1 >= 0, y1, y2)
-    return np.maximum(y, 0.0)
+    return _kernels.resolve("directsvi_w")(_as_f64(k), z0, z1, z2, z3, z4, z5)
 
 
 class DirectSVI(Parametrization):
@@ -1018,34 +924,16 @@ class SABR(Parametrization):
 
         from scipy.optimize import minimize
 
-        check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in self.arbitrage_condition
-        check_calendar = ArbitrageFreedom.NO_CALENDAR in self.arbitrage_condition
-        need_grid = check_butterfly or check_calendar
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200) if need_grid else None
-        w_prev = kwargs.get("w_prev")
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        core = _kernels.resolve("sabr_obj")
 
         def objective(params):
-            alpha, rho, nu = params
-            penalty = 0.0
-            if alpha <= 0:
-                penalty += 1e6 * (1 - alpha) ** 2
-                return 1e6 + penalty
-            if abs(rho) >= 0.999:
-                penalty += 1e6 * (abs(rho) - 0.999) ** 2
-                rho = np.clip(rho, -0.998, 0.998)
-            if nu < 0:
-                penalty += 1e6 * nu**2
-                nu = 0.0
-            w_model = sabr_total_variance(k, alpha, beta, rho, nu, F, T)
-            mse = float(np.mean((w_target - w_model) ** 2))
-            if need_grid:
-                w_g = sabr_total_variance(k_grid, alpha, beta, rho, nu, F, T)
-                if check_butterfly:
-                    dw_g, d2w_g = _finite_diff_derivatives(k_grid, w_g)
-                    penalty += 1e4 * _butterfly_penalty(k_grid, w_g, dw_g, d2w_g)
-                if check_calendar and w_prev is not None:
-                    penalty += 1e4 * _calendar_penalty(k_grid, w_g, w_prev)
-            return mse + penalty
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target, beta, F, T,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+            )
 
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
         w_atm = float(np.interp(0.0, k, w_target))
