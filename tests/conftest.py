@@ -15,6 +15,20 @@ from src.pysvi.calibration import (
 from typing import cast
 
 
+@pytest.fixture(params=["numpy", "numba"])
+def backend_mode(request) -> str:
+    """Run the depending test under both evaluation backends."""
+    from src.pysvi.models import use_numba, numba_available
+    from src.pysvi import _kernels
+
+    if request.param == "numba" and not numba_available():
+        pytest.skip("numba not installed")
+    prev = _kernels.numba_enabled()
+    use_numba(request.param == "numba")
+    yield request.param
+    use_numba(prev)
+
+
 @pytest.fixture
 def atm_slice() -> pd.DataFrame:
     """Synthetic realistic slice: F=100, T=0.25, noisy SVI smile."""
@@ -86,7 +100,7 @@ def fitted_slice_for_apply(calibrated_svi) -> Tuple[pd.DataFrame, Dict[str, floa
 
 
 @pytest.fixture
-def calibrated_svi(atm_slice) -> Tuple[SVI, pd.DataFrame, Dict[str, float]]:
+def calibrated_svi(atm_slice, backend_mode) -> Tuple[SVI, pd.DataFrame, Dict[str, float]]:
     """SVI + slice + guaranteed calibration."""
     df_slice = atm_slice
     model = cast(SVI, get_model("svi"))  # ← mypy cast
@@ -98,7 +112,7 @@ def calibrated_svi(atm_slice) -> Tuple[SVI, pd.DataFrame, Dict[str, float]]:
 
 
 @pytest.fixture
-def ssvi_calibrated(atm_slice) -> Tuple[SSVI, pd.DataFrame, Dict[str, float]]:
+def ssvi_calibrated(atm_slice, backend_mode) -> Tuple[SSVI, pd.DataFrame, Dict[str, float]]:
     """SSVI + explicit theta calibration."""
     df_slice = atm_slice
     model = cast(SSVI, get_model("ssvi"))  # ← mypy cast
@@ -111,7 +125,7 @@ def ssvi_calibrated(atm_slice) -> Tuple[SSVI, pd.DataFrame, Dict[str, float]]:
 
 
 @pytest.fixture
-def essvi_calibrated(atm_slice) -> Tuple[ESSVI, pd.DataFrame, Dict[str, float]]:
+def essvi_calibrated(atm_slice, backend_mode) -> Tuple[ESSVI, pd.DataFrame, Dict[str, float]]:
     """eSSVI + explicit theta/theta_ref calibration."""
     df_slice = atm_slice
     model = cast(ESSVI, get_model("essvi"))
@@ -126,7 +140,7 @@ def essvi_calibrated(atm_slice) -> Tuple[ESSVI, pd.DataFrame, Dict[str, float]]:
 
 
 @pytest.fixture
-def jw_calibrated(atm_slice) -> Tuple[JumpWings, pd.DataFrame, Dict[str, float]]:
+def jw_calibrated(atm_slice, backend_mode) -> Tuple[JumpWings, pd.DataFrame, Dict[str, float]]:
     """JumpWings + slice + guaranteed calibration."""
     df_slice = atm_slice
     model = cast(JumpWings, get_model("jw"))
@@ -141,7 +155,7 @@ def jw_calibrated(atm_slice) -> Tuple[JumpWings, pd.DataFrame, Dict[str, float]]
 
 
 @pytest.fixture
-def sabr_calibrated(atm_slice) -> Tuple[SABR, pd.DataFrame, Dict[str, float]]:
+def sabr_calibrated(atm_slice, backend_mode) -> Tuple[SABR, pd.DataFrame, Dict[str, float]]:
     """SABR + slice + guaranteed calibration (beta=1, equity-style slice)."""
     df_slice = atm_slice
     model = cast(SABR, get_model("sabr"))
@@ -157,7 +171,7 @@ def sabr_calibrated(atm_slice) -> Tuple[SABR, pd.DataFrame, Dict[str, float]]:
 
 
 @pytest.fixture
-def directsvi_calibrated(atm_slice) -> Tuple[DirectSVI, pd.DataFrame, Dict[str, float]]:
+def directsvi_calibrated(atm_slice, backend_mode) -> Tuple[DirectSVI, pd.DataFrame, Dict[str, float]]:
     """DirectSVI + slice + guaranteed calibration."""
     df_slice = atm_slice
     model = cast(DirectSVI, get_model("dsvi"))
