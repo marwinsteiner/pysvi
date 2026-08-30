@@ -9,9 +9,13 @@ toggled at runtime without re-importing.
 Composite functions (jw_total_variance and the fused per-model calibration
 objectives) are built by factories closing over their leaf kernels, so the
 same source produces a pure-NumPy version (closing over plain functions) and
-a jitted version (closing over jitted ones). Leaf kernels use ``cache=True``
-to persist compiled artifacts across sessions; numba cannot disk-cache
-closures, so the composites compile once per process on first use.
+a jitted version (closing over jitted ones).
+
+Kernels compile once per process on first use (a few seconds). Disk caching
+(``cache=True``) is deliberately not used: numba's cache pickles the module
+environment by module name, and the same source imported under two names
+(``pysvi`` installed vs ``src.pysvi`` in this repo's tests) crashes with
+ModuleNotFoundError when one's cache entry is loaded by the other.
 
 All jitted kernels use ``fastmath=True``: results may differ from the NumPy
 backend at the level of floating-point rounding (~1e-15 relative), far below
@@ -407,19 +411,18 @@ _PLAIN = {
 
 _JITTED: dict = {}
 if _NUMBA_AVAILABLE:
-    _jit_cached = _nb.njit(cache=True, fastmath=True)
-    _jit = _nb.njit(fastmath=True)  # closures cannot be disk-cached
+    _jit = _nb.njit(fastmath=True)
 
-    _svi_w_nb = _jit_cached(svi_w)
-    _ssvi_w_nb = _jit_cached(ssvi_w)
-    _essvi_w_nb = _jit_cached(essvi_w)
-    _sabr_vol_nb = _jit_cached(sabr_vol)
-    _directsvi_w_nb = _jit_cached(directsvi_w)
-    _svi_derivs_nb = _jit_cached(svi_derivs)
-    _ssvi_derivs_nb = _jit_cached(ssvi_derivs)
-    _butterfly_nb = _jit_cached(butterfly_penalty)
-    _calendar_nb = _jit_cached(calendar_penalty)
-    _finite_diff_nb = _jit_cached(finite_diff)
+    _svi_w_nb = _jit(svi_w)
+    _ssvi_w_nb = _jit(ssvi_w)
+    _essvi_w_nb = _jit(essvi_w)
+    _sabr_vol_nb = _jit(sabr_vol)
+    _directsvi_w_nb = _jit(directsvi_w)
+    _svi_derivs_nb = _jit(svi_derivs)
+    _ssvi_derivs_nb = _jit(ssvi_derivs)
+    _butterfly_nb = _jit(butterfly_penalty)
+    _calendar_nb = _jit(calendar_penalty)
+    _finite_diff_nb = _jit(finite_diff)
     _jw_w_nb = _jit(make_jw_w(_svi_w_nb))
 
     _JITTED = {
