@@ -31,7 +31,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies
-      run: uv sync --dev
+      run: uv sync --dev --extra numba
 
     - name: Run tests
       run: uv run pytest tests/ -v --cov=src/pysvi --cov-report=xml
