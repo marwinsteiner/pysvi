@@ -54,8 +54,9 @@ jobs:
 
     - name: Create GitHub Release
       # --notes-from-tag publishes the annotated tag message as the release
-      # notes (--generate-notes only summarises PRs, which direct pushes lack)
-      run: gh release create "${{ github.ref_name }}" --notes-from-tag
+      # notes (--generate-notes only summarises PRs, which direct pushes lack);
+      # explicit --title keeps the release title to the bare tag name
+      run: gh release create "${{ github.ref_name }}" --notes-from-tag --title "${{ github.ref_name }}"
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
