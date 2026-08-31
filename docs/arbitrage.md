@@ -1,5 +1,37 @@
 # Arbitrage freeness
 
+Arbitrage handling has two halves: *enforcement* during calibration (penalty flags, below) and *verification* of a fitted result (diagnostics). Constrained calibration is a soft penalty — always verify a fit you intend to rely on.
+
+## Verifying a fit
+
+`check_slice_arbitrage` inspects one calibrated slice; `check_arbitrage` inspects a set of slices across maturities:
+
+```python
+from pysvi import check_slice_arbitrage, check_arbitrage
+
+report = check_slice_arbitrage(model, params, maturity=0.25)
+report.ok               # single verdict
+print(report)
+# Slice (T=0.25):
+#   Butterfly arbitrage: none (min g = 2.452e-01 at k = -2.0000)
+#   Lee wing bounds:     satisfied (left slope = 0.1911, right slope = 0.0471, bound = 2)
+
+report = check_arbitrage(model, [(0.25, params_1), (0.5, params_2)])
+print(report)           # adds the calendar check between adjacent maturities
+```
+
+The reports carry numerical evidence, not just verdicts:
+
+- **Butterfly**: minimum of the density factor $g(k)$ over the grid and the log-moneyness where it occurs (butterfly-free iff $g(k) \geq 0$).
+- **Lee wing bounds**: total-variance wing slopes measured at the grid edges; the Lee moment formula requires $\limsup_{|k|\to\infty} w(k)/|k| \leq 2$ on each wing.
+- **Calendar**: minimum of $w(k, T_{i+1}) - w(k, T_i)$ over adjacent maturity pairs and the $(k, T_i, T_{i+1})$ where it is attained (calendar-free iff non-negative).
+
+The evaluation grid (`k_min`, `k_max`, `n_grid`) and tolerance are configurable; widen the grid for very wide smiles, since the wing slopes are measured at its edges.
+
+Diagnostics build on the public derivative API: every parametrization exposes `dw_dk(k, params)`, `d2w_dk2(k, params)` and `density(k, params)` — analytic for the SVI family (raw SVI, SSVI, eSSVI, jump-wings), central finite differences for SABR and DirectSVI.
+
+## Enforcement during calibration
+
 Every parametrization accepts an `arbitrage_condition` argument controlling how strictly no-arbitrage is enforced during calibration. The options are flags that can be combined with `|`:
 
 ```python
