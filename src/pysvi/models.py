@@ -349,19 +349,22 @@ class Parametrization(ABC):
             f"{self.__class__.__name__}.total_variance() must be implemented by subclasses."
         )
 
-    # Step for the default finite-difference derivatives. Central second-order
-    # differences: truncation error O(h^2) ~ 1e-10, roundoff on d2w ~ 1e-6*w.
-    _fd_step: float = 1e-5
+    #: Step for the default finite-difference derivatives (central,
+    #: second-order: truncation O(h^2), roundoff on w'' ~ eps/h^2). Set it
+    #: on an instance to trade truncation against roundoff; note the density
+    #: noise this induces for finite-difference models (SABR, DirectSVI) can
+    #: reach ~1e-2, far above the default diagnostics tolerance.
+    fd_step: float = 1e-5
 
-    def dw_dk(
+    def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """First derivative of total variance, w'(k).
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Total variance and its first two strike derivatives, (w, w', w'').
 
-        The base implementation uses central finite differences on
-        :meth:`total_variance`; parametrizations with tractable analytic
-        derivatives override it (SVI, SSVI, eSSVI, jump-wings). SABR and
-        DirectSVI use this finite-difference default.
+        The base implementation uses central finite differences with step
+        :attr:`fd_step` on :meth:`total_variance`; parametrizations with
+        tractable analytic derivatives override it (SVI, SSVI, eSSVI,
+        jump-wings). SABR and DirectSVI use this finite-difference default.
 
         Parameters
         ----------
@@ -372,28 +375,41 @@ class Parametrization(ABC):
 
         Returns
         -------
-        np.ndarray
-            w'(k) at each input point.
+        tuple of np.ndarray
+            (w(k), w'(k), w''(k)).
         """
         k = np.asarray(k, dtype=np.float64)
-        h = self._fd_step
+        h = self.fd_step
+        w = self.total_variance(k, params)
         w_up = self.total_variance(k + h, params)
         w_dn = self.total_variance(k - h, params)
-        return (w_up - w_dn) / (2.0 * h)
+        dw = (w_up - w_dn) / (2.0 * h)
+        d2w = (w_up - 2.0 * w + w_dn) / (h * h)
+        return w, dw, d2w
+
+    def dw_dk(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """First derivative of total variance, w'(k). See :meth:`derivatives`."""
+        return self.derivatives(k, params)[1]
 
     def d2w_dk2(
         self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
-        """Second derivative of total variance, w''(k).
+        """Second derivative of total variance, w''(k). See :meth:`derivatives`."""
+        return self.derivatives(k, params)[2]
 
-        Same override policy as :meth:`dw_dk`.
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic total-variance wing slopes (left, right).
+
+        Returns lim dw/d(abs(k)) on each wing where a closed form exists
+        (the SVI family), else None — callers should fall back to
+        measuring dw/dk at finite k, which underestimates the asymptote
+        for convex w. Used by the Lee-bound check in the diagnostics.
         """
-        k = np.asarray(k, dtype=np.float64)
-        h = self._fd_step
-        w_up = self.total_variance(k + h, params)
-        w_mid = self.total_variance(k, params)
-        w_dn = self.total_variance(k - h, params)
-        return (w_up - 2.0 * w_mid + w_dn) / (h * h)
+        return None
 
     def density(
         self, k: NDArray[np.float64], params: Dict[str, float]
@@ -405,10 +421,11 @@ class Parametrization(ABC):
             g(k) = (1 - k w'/(2w))^2 - (w')^2/4 (1/w + 1/4) + w''/2
 
         The slice is free of butterfly arbitrage iff g(k) >= 0 for all k
-        [Gatheral & Jacquier 2014]. Uses :meth:`dw_dk` / :meth:`d2w_dk2`,
-        so models with analytic derivatives get an analytic density.
-        Requires w(k) > 0; garbage-in (non-positive total variance)
-        produces NaN/inf rather than raising.
+        [Gatheral & Jacquier 2014]. Uses :meth:`derivatives`, so models
+        with analytic derivatives get an analytic density. Only valid
+        where w(k) > 0; non-positive total variance produces NaN/inf or
+        meaningless values rather than raising — validate w separately
+        (the diagnostics module does).
 
         Parameters
         ----------
@@ -423,15 +440,9 @@ class Parametrization(ABC):
             g(k) at each input point.
         """
         k = np.asarray(k, dtype=np.float64)
-        w = self.total_variance(k, params)
-        dw = self.dw_dk(k, params)
-        d2w = self.d2w_dk2(k, params)
+        w, dw, d2w = self.derivatives(k, params)
         with np.errstate(divide="ignore", invalid="ignore"):
-            return (
-                (1.0 - k * dw / (2.0 * w)) ** 2
-                - (dw**2) / 4.0 * (1.0 / w + 0.25)
-                + d2w / 2.0
-            )
+            return _kernels.resolve("density_g")(k, w, dw, d2w)
 
 
 class SVI(Parametrization):
@@ -526,25 +537,21 @@ class SVI(Parametrization):
         svi_params = {p: params[p] for p in ["a", "b", "rho", "m", "sigma"]}
         return svi_total_variance(k, **svi_params)
 
-    def dw_dk(
+    def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w'(k) = b(ρ + z/sqrt(z² + σ²)), z = k - m."""
-        _, dw, _ = _svi_derivatives(
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') for raw SVI."""
+        return _svi_derivatives(
             _as_f64(k), params["a"], params["b"], params["rho"],
             params["m"], params["sigma"],
         )
-        return dw
 
-    def d2w_dk2(
-        self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w''(k) = bσ²/(z² + σ²)^(3/2), z = k - m."""
-        _, _, d2w = _svi_derivatives(
-            _as_f64(k), params["a"], params["b"], params["rho"],
-            params["m"], params["sigma"],
-        )
-        return d2w
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes: left b(1 - ρ), right b(1 + ρ)."""
+        b, rho = params["b"], params["rho"]
+        return b * (1.0 - rho), b * (1.0 + rho)
 
 
 class SSVI(Parametrization):
@@ -618,25 +625,22 @@ class SSVI(Parametrization):
         phi_theta = params["eta"] / np.sqrt(theta)
         return ssvi_total_variance(k, theta, params["rho"], phi_theta)
 
-    def dw_dk(
+    def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w'(k) for SSVI."""
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') for SSVI."""
         theta = params["theta"]
-        _, dw, _ = _ssvi_derivatives(
+        return _ssvi_derivatives(
             _as_f64(k), theta, params["rho"], params["eta"] / np.sqrt(theta)
         )
-        return dw
 
-    def d2w_dk2(
-        self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w''(k) for SSVI."""
-        theta = params["theta"]
-        _, _, d2w = _ssvi_derivatives(
-            _as_f64(k), theta, params["rho"], params["eta"] / np.sqrt(theta)
-        )
-        return d2w
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes: θφ(1 ∓ ρ)/2."""
+        theta, rho = params["theta"], params["rho"]
+        phi = params["eta"] / np.sqrt(theta)
+        return 0.5 * theta * phi * (1.0 - rho), 0.5 * theta * phi * (1.0 + rho)
 
 
 class ESSVI(Parametrization):
@@ -710,8 +714,7 @@ class ESSVI(Parametrization):
         if eta <= 0:
             return None
 
-        theta_ratio = theta / max(theta_ref, 1e-12)
-        rho_theta = np.clip(rho0 + rho1 * (theta_ratio**alpha), -0.999, 0.999)
+        rho_theta = self._rho_of(theta, theta_ref, rho0, rho1, alpha)
 
         return {
             "rho0": float(rho0),
@@ -724,16 +727,29 @@ class ESSVI(Parametrization):
         }
 
     @staticmethod
+    def _rho_of(
+        theta: float, theta_ref: float, rho0: float, rho1: float, alpha: float
+    ) -> float:
+        """The ρ(θ) term structure: clip(ρ₀ + ρ₁(θ/θ_ref)^α, ±0.999)."""
+        ratio = theta / max(theta_ref, 1e-12)
+        return float(np.clip(rho0 + rho1 * ratio**alpha, -0.999, 0.999))
+
+    @staticmethod
     def _rho_phi(params: Dict[str, float]) -> tuple[float, float, float]:
-        """Resolve (theta, rho(theta), phi(theta)) from a params dict."""
+        """Resolve (theta, rho(theta), phi(theta)) from a params dict.
+
+        A stored ``rho_theta`` takes precedence and suffices on its own;
+        otherwise it is computed from (rho0, rho1, alpha, theta_ref).
+        """
         theta = params["theta"]
-        rho_theta = params.get(
-            "rho_theta",
-            params["rho0"]
-            + params["rho1"]
-            * (theta / max(params["theta_ref"], 1e-12)) ** params["alpha"],
-        )
-        rho_theta = float(np.clip(rho_theta, -0.999, 0.999))
+        rho_theta = params.get("rho_theta")
+        if rho_theta is None:
+            rho_theta = ESSVI._rho_of(
+                theta, params["theta_ref"],
+                params["rho0"], params["rho1"], params["alpha"],
+            )
+        else:
+            rho_theta = float(np.clip(rho_theta, -0.999, 0.999))
         phi_theta = params["eta"] / np.sqrt(theta)
         return theta, rho_theta, phi_theta
 
@@ -743,21 +759,22 @@ class ESSVI(Parametrization):
         theta, rho_theta, phi_theta = self._rho_phi(params)
         return essvi_total_variance(k, theta, rho_theta, phi_theta)
 
-    def dw_dk(
+    def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w'(k) for eSSVI (SSVI form with ρ(θ))."""
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') for eSSVI (SSVI form with ρ(θ))."""
         theta, rho_theta, phi_theta = self._rho_phi(params)
-        _, dw, _ = _ssvi_derivatives(_as_f64(k), theta, rho_theta, phi_theta)
-        return dw
+        return _ssvi_derivatives(_as_f64(k), theta, rho_theta, phi_theta)
 
-    def d2w_dk2(
-        self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w''(k) for eSSVI (SSVI form with ρ(θ))."""
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes: θφ(1 ∓ ρ(θ))/2."""
         theta, rho_theta, phi_theta = self._rho_phi(params)
-        _, _, d2w = _ssvi_derivatives(_as_f64(k), theta, rho_theta, phi_theta)
-        return d2w
+        return (
+            0.5 * theta * phi_theta * (1.0 - rho_theta),
+            0.5 * theta * phi_theta * (1.0 + rho_theta),
+        )
 
 
 class JumpWings(Parametrization):
@@ -856,51 +873,38 @@ class JumpWings(Parametrization):
     def _raw_svi(params: Dict[str, float]) -> Optional[tuple[float, float, float, float, float]]:
         """Jump-wings → raw SVI (a, b, rho, m, sigma); None for a flat slice.
 
-        Mirrors the conversion inside the jw_total_variance kernel.
+        Delegates to the shared jw_convert kernel — the single source used
+        by evaluation and the calibration objectives.
         """
-        v_t, psi_t, p_t, c_t, v_tilde_t, T = (
-            params[x] for x in ("v_t", "psi_t", "p_t", "c_t", "v_tilde_t", "T")
+        ok, a, b, rho, m, sigma = _kernels.resolve("jw_convert")(
+            params["v_t"], params["psi_t"], params["p_t"],
+            params["c_t"], params["v_tilde_t"], params["T"],
         )
-        b = (p_t + c_t) / 2.0
-        if b < 1e-12:
+        if not ok:
             return None  # degenerate: w(k) = v_t * T for all k
-        rho = 1.0 - p_t / b
-        beta = min(max(rho - 2.0 * psi_t * np.sqrt(T) / b, -0.9999), 0.9999)
-        if abs(beta) < 1e-12:
-            alpha = 0.0
-        else:
-            sign_beta = 1.0 if beta > 0.0 else -1.0
-            alpha = sign_beta * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
-        sign_alpha = 1.0 if alpha > 0.0 else (-1.0 if alpha < 0.0 else 0.0)
-        denom = (
-            -rho
-            + sign_alpha * np.sqrt(1.0 + alpha * alpha)
-            - alpha * np.sqrt(1.0 - rho * rho)
-        )
-        m = (v_t - v_tilde_t) * T / (b * denom) if abs(denom) > 1e-12 else 0.0
-        sigma = max(abs(alpha * m), 1e-12)
-        a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho * rho)
         return a, b, rho, m, sigma
 
-    def dw_dk(
+    def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w'(k) via the raw-SVI equivalent parameters."""
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') via the raw-SVI equivalent parameters."""
+        k = _as_f64(k)
         raw = self._raw_svi(params)
         if raw is None:
-            return np.zeros_like(_as_f64(k))
-        _, dw, _ = _svi_derivatives(_as_f64(k), *raw)
-        return dw
+            w = np.full_like(k, params["v_t"] * params["T"])
+            zero = np.zeros_like(k)
+            return w, zero, zero.copy()
+        return _svi_derivatives(k, *raw)
 
-    def d2w_dk2(
-        self, k: NDArray[np.float64], params: Dict[str, float]
-    ) -> NDArray[np.float64]:
-        """Analytic w''(k) via the raw-SVI equivalent parameters."""
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes via the raw-SVI equivalents: b(1 ∓ ρ)."""
         raw = self._raw_svi(params)
         if raw is None:
-            return np.zeros_like(_as_f64(k))
-        _, _, d2w = _svi_derivatives(_as_f64(k), *raw)
-        return d2w
+            return 0.0, 0.0
+        _, b, rho, _, _ = raw
+        return b * (1.0 - rho), b * (1.0 + rho)
 
 
 def directsvi_fit(
