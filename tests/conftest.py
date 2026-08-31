@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 
 # src/pysvi absolute imports (tests/ and src/ siblings)
 from src.pysvi.models import (
-    SVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
+    SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
     svi_total_variance
 )
 from src.pysvi.calibration import (
@@ -107,6 +107,19 @@ def calibrated_svi(atm_slice, backend_mode) -> Tuple[SVI, pd.DataFrame, Dict[str
     params = calibrate_slice(df_slice, model)
     assert params is not None
     assert all(params[k] > 0 for k in ["a", "b", "sigma"])
+    assert abs(params["rho"]) < 0.999
+    return model, df_slice, params
+
+
+@pytest.fixture
+def natural_calibrated(atm_slice, backend_mode) -> Tuple[NaturalSVI, pd.DataFrame, Dict[str, float]]:
+    """NaturalSVI + slice + guaranteed calibration."""
+    df_slice = atm_slice
+    model = cast(NaturalSVI, get_model("natural"))
+    params = calibrate_slice(df_slice, model)
+    assert params is not None
+    assert params["omega"] > 0
+    assert params["zeta"] > 0
     assert abs(params["rho"]) < 0.999
     return model, df_slice, params
 

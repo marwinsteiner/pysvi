@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from src.pysvi.models import (
-    SVI, SSVI, ESSVI, JumpWings, SABR, DirectSVI, Parametrization,
+    SVI, NaturalSVI, SSVI, ESSVI, JumpWings, SABR, DirectSVI, Parametrization,
     ArbitrageFreedom,
 )
 from src.pysvi.calibration import calibrate_slice
@@ -14,6 +14,7 @@ _K = np.linspace(-0.5, 0.5, 41)
 # (model instance, params) for every parametrization
 _ANALYTIC_CASES = [
     (SVI(), {"a": 0.01, "b": 0.12, "rho": -0.6, "m": 0.01, "sigma": 0.25}),
+    (NaturalSVI(), {"delta": 0.005, "mu": 0.02, "rho": -0.5, "omega": 0.04, "zeta": 1.8}),
     (SSVI(), {"rho": -0.5, "eta": 1.2, "theta": 0.02}),
     (ESSVI(), {"rho0": 0.0, "rho1": -0.5, "alpha": 0.5, "eta": 1.0,
                "theta": 0.02, "theta_ref": 0.02}),
