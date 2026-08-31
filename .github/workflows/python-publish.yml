@@ -7,6 +7,9 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # Dispatched by release-train.yml at a tag ref: tags pushed with the
+  # default GITHUB_TOKEN do not fire `on: push`, but explicit dispatch works.
+  workflow_dispatch:
 
 permissions:
   contents: read

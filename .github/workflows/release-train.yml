@@ -1,0 +1,89 @@
+# .github/workflows/release-train.yml
+#
+# Scheduled release train: runs every Sunday and releases at most one version.
+#
+# How a release happens:
+#   1. A milestone named vX.Y.Z has a due date that has passed and is still open.
+#   2. An open PR carries that milestone AND the `release-ready` label.
+#   3. The train merges the PR, creates an annotated tag vX.Y.Z whose message is
+#      the PR title + body (so write the PR description as the release notes),
+#      pushes it, dispatches the CI/CD pipeline at that tag (tags pushed with
+#      GITHUB_TOKEN do not fire `on: push` workflows, but workflow_dispatch is
+#      exempt from that restriction), and closes the milestone.
+#
+# If no milestone is due or no release-ready PR exists, the run is a no-op.
+# Rescheduling a release = moving the milestone due date. Only the earliest
+# due milestone is considered, so a missed week is caught up first.
+
+name: release-train
+
+on:
+  schedule:
+    - cron: "0 16 * * 0"  # Sundays 16:00 UTC
+  workflow_dispatch:       # manual trigger for testing / off-schedule release
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  issues: write  # closing milestones
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release due milestone if a ready PR exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          MS_JSON=$(gh api "repos/$REPO/milestones?state=open" --jq \
+            '[.[] | select(.due_on != null and (.due_on | fromdateiso8601) <= now)] | sort_by(.due_on) | .[0] // empty')
+          if [ -z "$MS_JSON" ]; then
+            echo "No milestone is due. Nothing to release."
+            exit 0
+          fi
+          MS_TITLE=$(echo "$MS_JSON" | jq -r .title)
+          MS_NUMBER=$(echo "$MS_JSON" | jq -r .number)
+          echo "Due milestone: $MS_TITLE (#$MS_NUMBER)"
+
+          PR=$(gh pr list --repo "$REPO" --state open --label release-ready \
+            --json number,milestone --jq \
+            "[.[] | select(.milestone.title == \"$MS_TITLE\")] | .[0].number // empty")
+          if [ -z "$PR" ]; then
+            echo "Milestone $MS_TITLE is due but no open PR with label 'release-ready' carries it. Skipping."
+            exit 0
+          fi
+          echo "Release PR: #$PR"
+
+          if ! gh pr checks "$PR" --repo "$REPO"; then
+            echo "::error::PR #$PR has failing or pending checks; not releasing $MS_TITLE."
+            exit 1
+          fi
+
+          TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
+          BODY=$(gh pr view "$PR" --repo "$REPO" --json body --jq .body)
+
+          gh pr merge "$PR" --repo "$REPO" --merge \
+            --subject "Merge PR #$PR: $TITLE"
+
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+          printf '%s\n\n%s\n' "$TITLE" "$BODY" > /tmp/tag_message
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$MS_TITLE" -F /tmp/tag_message
+          git push origin "$MS_TITLE"
+
+          gh workflow run python-publish.yml --repo "$REPO" --ref "$MS_TITLE"
+
+          gh api -X PATCH "repos/$REPO/milestones/$MS_NUMBER" -f state=closed
+          echo "Released $MS_TITLE from PR #$PR and dispatched the deploy pipeline."
