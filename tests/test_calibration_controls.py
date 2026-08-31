@@ -97,7 +97,10 @@ def test_robust_losses_recover_clean_smile(loss):
 
 
 def test_explicit_f_scale_accepted():
-    params = SVI().calibrate(_K_GRID, _W_TRUE, loss="huber", f_scale=1e-4)
+    params = SVI().calibrate(
+        _K_GRID, _W_TRUE, loss="huber", f_scale=1e-4,
+        initialization="multi_start",
+    )
     assert params is not None
     assert _fit_rmse(params) < 1e-4
 
