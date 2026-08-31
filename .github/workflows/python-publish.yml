@@ -53,7 +53,9 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Create GitHub Release
-      run: gh release create "${{ github.ref_name }}" --generate-notes
+      # --notes-from-tag publishes the annotated tag message as the release
+      # notes (--generate-notes only summarises PRs, which direct pushes lack)
+      run: gh release create "${{ github.ref_name }}" --notes-from-tag
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
