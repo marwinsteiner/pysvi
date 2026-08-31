@@ -20,13 +20,14 @@ model = get_model("svi")                                  # default QUASI constr
 model = get_model("sabr", ArbitrageFreedom.NO_BUTTERFLY)  # with density check
 ```
 
-The factory accepts `"svi"`, `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), `"directsvi"` (or `"dsvi"`), and `"sabr"` (case-insensitive).
+The factory accepts `"svi"`, `"natural"` (or `"nsvi"`), `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), `"directsvi"` (or `"dsvi"`), and `"sabr"` (case-insensitive).
 
 ## Choosing a model
 
 | Model | Free params / slice | Extra inputs | Best for |
 |-------|--------------------:|--------------|----------|
 | {doc}`svi` | 5 | — | Maximum flexibility, liquid equity smiles |
+| {doc}`natural` | 5 | — | Same family as raw SVI with better-behaved parameters |
 | {doc}`ssvi` | 2 | `theta` | Butterfly-arbitrage-free by construction |
 | {doc}`essvi` | 4 (global) | `theta`, `theta_ref` | Realistic calendar skew across maturities |
 | {doc}`jumpwings` | 5 | `T` | Trader-interpretable parameters (wings, ATM) |
@@ -39,6 +40,7 @@ Each model page follows the same structure: overview, model equations, parameter
 :maxdepth: 1
 
 svi
+natural
 ssvi
 essvi
 jumpwings

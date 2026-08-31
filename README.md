@@ -10,7 +10,7 @@
 
 Stochastic volatility inspired (SVI) parametrizations of the implied volatility surface in Python — plus the SABR stochastic volatility model.
 
-`svi-py` calibrates smooth, arbitrage-aware total variance surfaces from panels of European option prices: raw SVI, SSVI, eSSVI, jump-wings, DirectSVI, and SABR behind one interface, with configurable no-arbitrage constraints and a full data-preparation pipeline.
+`svi-py` calibrates smooth, arbitrage-aware total variance surfaces from panels of European option prices: raw SVI, natural SVI, SSVI, eSSVI, jump-wings, DirectSVI, and SABR behind one interface, with configurable no-arbitrage constraints and a full data-preparation pipeline.
 
 **Full documentation: [pysvi.readthedocs.io](https://pysvi.readthedocs.io)**
 
@@ -42,7 +42,7 @@ fitted = apply_slice(df_slice, params, model)
 print(fitted[["strike", "iv", "fitted_iv", "residual_iv"]])
 ```
 
-The factory accepts `"svi"`, `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), `"directsvi"` (or `"dsvi"`), and `"sabr"`. Some models take extra per-slice arguments (`theta` for SSVI/eSSVI, `T` for jump-wings, `T`/`F`/`beta` for SABR) — see the [documentation](https://pysvi.readthedocs.io) for each parametrization's formulas, parameters, and usage, plus arbitrage-constraint options and the input-preparation helpers.
+The factory accepts `"svi"`, `"natural"` (or `"nsvi"`), `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), `"directsvi"` (or `"dsvi"`), and `"sabr"`. Some models take extra per-slice arguments (`theta` for SSVI/eSSVI, `T` for jump-wings, `T`/`F`/`beta` for SABR) — see the [documentation](https://pysvi.readthedocs.io) for each parametrization's formulas, parameters, and usage, plus arbitrage-constraint options and the input-preparation helpers.
 
 ## Contributing
 
