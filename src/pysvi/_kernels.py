@@ -178,6 +178,29 @@ def jw_convert(v_t, psi_t, p_t, c_t, v_tilde_t, T):
     return True, a, b, rho, m, sigma
 
 
+def natural_convert(delta, mu, rho, omega, zeta):
+    """Natural SVI -> raw SVI (a, b, rho, m, sigma).
+
+    [Gatheral & Jacquier 2014, eq. 3.2]: the bijection
+    a = delta + omega(1 - rho^2)/2, b = omega*zeta/2,
+    m = mu - rho/zeta, sigma = sqrt(1 - rho^2)/zeta.
+    Requires zeta > 0 and abs(rho) < 1.
+    """
+    a = delta + 0.5 * omega * (1.0 - rho * rho)
+    b = 0.5 * omega * zeta
+    m = mu - rho / zeta
+    sigma = np.sqrt(1.0 - rho * rho) / zeta
+    return a, b, rho, m, sigma
+
+
+def make_natural_w(svi_w_fn, convert_fn):
+    def natural_w(k, delta, mu, rho, omega, zeta):
+        a, b, rho_r, m, sigma = convert_fn(delta, mu, rho, omega, zeta)
+        return svi_w_fn(k, a, b, rho_r, m, sigma)
+
+    return natural_w
+
+
 def make_butterfly_penalty(density_g_fn):
     def butterfly_penalty(k, w, dw, d2w):
         g = density_g_fn(k, w, dw, d2w)
@@ -246,6 +269,36 @@ def make_svi_objective(svi_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
             w_g = svi_w_fn(k_grid, a, b, rho, m, sigma)
             if check_bf:
                 _, dw_g, d2w_g = svi_derivs_fn(k_grid, a, b, rho, m, sigma)
+                penalty += 1e4 * butterfly_fn(k_grid, w_g, dw_g, d2w_g)
+            if check_cal and has_prev:
+                penalty += 1e4 * calendar_fn(w_g, w_prev)
+        return mse + penalty
+
+    return objective
+
+
+def make_natural_objective(natural_w_fn, convert_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
+    def objective(p, k, w_target, k_grid, w_prev, check_bf, check_cal, has_prev):
+        delta, mu, rho, omega, zeta = p[0], p[1], p[2], p[3], p[4]
+        penalty = 0.0
+        if omega <= 0.0:
+            penalty += 1e6 * (1.0 - omega) ** 2
+        if abs(rho) >= 0.999:
+            penalty += 1e6 * (abs(rho) - 0.999) ** 2
+            if rho > 0.998:
+                rho = 0.998
+            elif rho < -0.998:
+                rho = -0.998
+        if zeta <= 0.0:
+            penalty += 1e6 * (1.0 - zeta) ** 2
+            zeta = 1e-8
+        w_model = natural_w_fn(k, delta, mu, rho, omega, zeta)
+        mse = np.mean((w_target - w_model) ** 2)
+        if (check_bf or check_cal) and omega > 0.0:
+            w_g = natural_w_fn(k_grid, delta, mu, rho, omega, zeta)
+            if check_bf:
+                a, b, rho_r, m, sigma = convert_fn(delta, mu, rho, omega, zeta)
+                _, dw_g, d2w_g = svi_derivs_fn(k_grid, a, b, rho_r, m, sigma)
                 penalty += 1e4 * butterfly_fn(k_grid, w_g, dw_g, d2w_g)
             if check_cal and has_prev:
                 penalty += 1e4 * calendar_fn(w_g, w_prev)
@@ -389,9 +442,12 @@ def make_sabr_objective(sabr_vol_fn, finite_diff_fn, butterfly_fn, calendar_fn):
 
 butterfly_penalty = make_butterfly_penalty(density_g)
 jw_w = make_jw_w(svi_w, jw_convert)
+natural_w = make_natural_w(svi_w, natural_convert)
 
 _PLAIN = {
     "svi_w": svi_w,
+    "natural_w": natural_w,
+    "natural_convert": natural_convert,
     "ssvi_w": ssvi_w,
     "essvi_w": essvi_w,
     "jw_w": jw_w,
@@ -405,6 +461,7 @@ _PLAIN = {
     "calendar": calendar_penalty,
     "finite_diff": finite_diff,
     "svi_obj": make_svi_objective(svi_w, svi_derivs, butterfly_penalty, calendar_penalty),
+    "natural_obj": make_natural_objective(natural_w, natural_convert, svi_derivs, butterfly_penalty, calendar_penalty),
     "ssvi_obj": make_ssvi_objective(ssvi_w, ssvi_derivs, butterfly_penalty, calendar_penalty),
     "essvi_obj": make_essvi_objective(essvi_w, ssvi_derivs, butterfly_penalty, calendar_penalty),
     "jw_obj": make_jw_objective(jw_w, jw_convert, svi_derivs, butterfly_penalty, calendar_penalty),
@@ -428,9 +485,13 @@ if _NUMBA_AVAILABLE:
     _calendar_nb = _jit(calendar_penalty)
     _finite_diff_nb = _jit(finite_diff)
     _jw_w_nb = _jit(make_jw_w(_svi_w_nb, _jw_convert_nb))
+    _natural_convert_nb = _jit(natural_convert)
+    _natural_w_nb = _jit(make_natural_w(_svi_w_nb, _natural_convert_nb))
 
     _JITTED = {
         "svi_w": _svi_w_nb,
+        "natural_w": _natural_w_nb,
+        "natural_convert": _natural_convert_nb,
         "ssvi_w": _ssvi_w_nb,
         "essvi_w": _essvi_w_nb,
         "jw_w": _jw_w_nb,
@@ -444,6 +505,7 @@ if _NUMBA_AVAILABLE:
         "calendar": _calendar_nb,
         "finite_diff": _finite_diff_nb,
         "svi_obj": _jit(make_svi_objective(_svi_w_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb)),
+        "natural_obj": _jit(make_natural_objective(_natural_w_nb, _natural_convert_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb)),
         "ssvi_obj": _jit(make_ssvi_objective(_ssvi_w_nb, _ssvi_derivs_nb, _butterfly_nb, _calendar_nb)),
         "essvi_obj": _jit(make_essvi_objective(_essvi_w_nb, _ssvi_derivs_nb, _butterfly_nb, _calendar_nb)),
         "jw_obj": _jit(make_jw_objective(_jw_w_nb, _jw_convert_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb)),
