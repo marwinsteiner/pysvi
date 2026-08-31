@@ -35,7 +35,8 @@ _FD_CASES = [
 def test_analytic_dw_dk_matches_numerical(model, params):
     """Analytic w'(k) matches central finite differences to 1e-8."""
     dw_analytic = model.dw_dk(_K, params)
-    dw_fd = Parametrization.dw_dk(model, _K, params)
+    # Unbound base-class call forces the finite-difference implementation
+    _, dw_fd, _ = Parametrization.derivatives(model, _K, params)
     np.testing.assert_allclose(dw_analytic, dw_fd, atol=1e-8)
 
 
@@ -46,8 +47,43 @@ def test_analytic_dw_dk_matches_numerical(model, params):
 def test_analytic_d2w_dk2_matches_numerical(model, params):
     """Analytic w''(k) matches finite differences within FD roundoff (~1e-6)."""
     d2w_analytic = model.d2w_dk2(_K, params)
-    d2w_fd = Parametrization.d2w_dk2(model, _K, params)
+    _, _, d2w_fd = Parametrization.derivatives(model, _K, params)
     np.testing.assert_allclose(d2w_analytic, d2w_fd, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "model,params", _ANALYTIC_CASES + _FD_CASES,
+    ids=[type(m).__name__ for m, _ in _ANALYTIC_CASES + _FD_CASES],
+)
+def test_derivatives_consistent_with_wrappers(model, params):
+    """derivatives() agrees with total_variance/dw_dk/d2w_dk2 wrappers."""
+    w, dw, d2w = model.derivatives(_K, params)
+    np.testing.assert_allclose(w, model.total_variance(_K, params), rtol=1e-12)
+    np.testing.assert_allclose(dw, model.dw_dk(_K, params), rtol=1e-12)
+    np.testing.assert_allclose(d2w, model.d2w_dk2(_K, params), rtol=1e-12)
+
+
+def test_wing_slopes_analytic_models():
+    """Closed-form wing slopes match large-k measured slopes."""
+    far = np.array([-60.0, 60.0])
+    for model, params in _ANALYTIC_CASES:
+        slopes = model.wing_slopes(params)
+        assert slopes is not None
+        dw = model.dw_dk(far, params)
+        np.testing.assert_allclose(slopes[0], -dw[0], rtol=1e-3)
+        np.testing.assert_allclose(slopes[1], dw[1], rtol=1e-3)
+    for model, params in _FD_CASES:
+        assert model.wing_slopes(params) is None
+
+
+def test_essvi_rho_theta_only_params():
+    """A params dict carrying rho_theta directly needs no rho0/rho1/alpha."""
+    model = ESSVI()
+    params = {"theta": 0.02, "eta": 1.0, "rho_theta": -0.5}
+    w = model.total_variance(_K, params)
+    assert np.all(np.isfinite(w))
+    assert np.all(np.isfinite(model.density(_K, params)))
+    assert model.wing_slopes(params) is not None
 
 
 @pytest.mark.parametrize(

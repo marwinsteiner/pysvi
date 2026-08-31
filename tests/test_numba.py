@@ -33,6 +33,8 @@ _PARITY_CASES = {
     "svi_derivs": (_kg, 0.01, 0.12, -0.6, 0.01, 0.25),
     "ssvi_derivs": (_kg, 0.02, -0.5, 1.3),
     "butterfly": (_kg, _wg, np.gradient(_wg, _kg), np.gradient(np.gradient(_wg, _kg), _kg)),
+    "density_g": (_kg, _wg, np.gradient(_wg, _kg), np.gradient(np.gradient(_wg, _kg), _kg)),
+    "jw_convert": (0.04, -0.1, 0.15, 0.05, 0.035, 0.25),
     "calendar": (_wg, _wg * 1.01),
     "finite_diff": (_kg, _wg),
     "svi_obj": (np.array([0.011, 0.1, -0.5, 0.0, 0.2]), _k, _w, _kg, _wg * 0.9, True, True, True),
