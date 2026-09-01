@@ -131,6 +131,96 @@ def jw_total_variance(
     return _kernels.resolve("jw_w")(_as_f64(k), v_t, psi_t, p_t, c_t, v_tilde_t, T)
 
 
+def natural_total_variance(
+    k: np.ndarray, delta: float, mu: float, rho: float, omega: float, zeta: float
+) -> np.ndarray:
+    """Natural SVI total variance w(k) [Gatheral & Jacquier 2014].
+
+    ::
+
+        w(k) = Δ + ω/2 {1 + ζρ(k − μ) + sqrt[(ζ(k − μ) + ρ)² + (1 − ρ²)]}
+
+    Bijective with raw SVI (see :func:`natural_to_raw` /
+    :func:`raw_to_natural`); the natural parameters map more directly to
+    ATM level, skew, and curvature.
+
+    Parameters
+    ----------
+    k : array
+        Log-moneyness log(K/F).
+    delta : float
+        Vertical variance shift (minimum-variance level).
+    mu : float
+        Log-moneyness translation of the smile.
+    rho : float
+        Skew (correlation), abs(rho) < 1.
+    omega : float
+        Overall variance scale, omega >= 0.
+    zeta : float
+        Curvature / smile-width scale, zeta > 0.
+
+    Returns
+    -------
+    array
+        Total variance w(k) = sigma^2(k) * T.
+    """
+    return _kernels.resolve("natural_w")(_as_f64(k), delta, mu, rho, omega, zeta)
+
+
+def natural_to_raw(
+    delta: float, mu: float, rho: float, omega: float, zeta: float
+) -> Dict[str, float]:
+    """Natural SVI parameters -> raw SVI parameters.
+
+    ::
+
+        a = Δ + ω(1 − ρ²)/2,   b = ωζ/2,   ρ = ρ,
+        m = μ − ρ/ζ,           σ = sqrt(1 − ρ²)/ζ
+
+    Requires zeta > 0 and abs(rho) < 1.
+
+    Returns
+    -------
+    dict
+        {'a', 'b', 'rho', 'm', 'sigma'}.
+    """
+    a, b, rho_r, m, sigma = _kernels.resolve("natural_convert")(
+        delta, mu, rho, omega, zeta
+    )
+    return {
+        "a": float(a), "b": float(b), "rho": float(rho_r),
+        "m": float(m), "sigma": float(sigma),
+    }
+
+
+def raw_to_natural(
+    a: float, b: float, rho: float, m: float, sigma: float
+) -> Dict[str, float]:
+    """Raw SVI parameters -> natural SVI parameters (inverse bijection).
+
+    ::
+
+        ζ = sqrt(1 − ρ²)/σ,   ω = 2bσ/sqrt(1 − ρ²),   ρ = ρ,
+        μ = m + ρσ/sqrt(1 − ρ²),   Δ = a − bσ sqrt(1 − ρ²)
+
+    Requires sigma > 0 and abs(rho) < 1.
+
+    Returns
+    -------
+    dict
+        {'delta', 'mu', 'rho', 'omega', 'zeta'}.
+    """
+    root = np.sqrt(1.0 - rho * rho)
+    zeta = root / sigma
+    omega = 2.0 * b * sigma / root
+    mu = m + rho * sigma / root
+    delta = a - b * sigma * root
+    return {
+        "delta": float(delta), "mu": float(mu), "rho": float(rho),
+        "omega": float(omega), "zeta": float(zeta),
+    }
+
+
 def sabr_implied_vol(
     k: np.ndarray, alpha: float, beta: float, rho: float, nu: float,
     F: float, T: float,
@@ -293,6 +383,197 @@ def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     return k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar
 
 
+#: Residual spaces for calibration; codes shared with the loss kernels.
+_OBJECTIVE_CODES = {
+    "total_variance": 0,
+    "implied_vol": 1,
+    "price": 2,
+    "vega_weighted": 3,
+    "bid_ask": 4,
+}
+
+#: Robust losses (scipy.least_squares convention).
+_LOSS_CODES = {"l2": 0, "huber": 1, "soft_l1": 2, "cauchy": 3}
+
+
+def _prepare_loss_inputs(k, w_target, kwargs):
+    """Resolve the calibration residual space and robust loss from kwargs.
+
+    Returns (mode, loss_code, weights, w_lo, w_hi). Vega weights are
+    precomputed here from the market data (Black vega up to per-slice
+    constants, normalized to mean one); the bid/ask band arrives as
+    total-variance arrays via the 'w_bid'/'w_ask' kwargs.
+    """
+    objective = kwargs.get("objective", "total_variance")
+    loss = kwargs.get("loss", "l2")
+    if objective not in _OBJECTIVE_CODES:
+        raise ValueError(
+            f"unknown objective {objective!r}; choose from {sorted(_OBJECTIVE_CODES)}"
+        )
+    if loss not in _LOSS_CODES:
+        raise ValueError(
+            f"unknown loss {loss!r}; choose from {sorted(_LOSS_CODES)}"
+        )
+    mode = _OBJECTIVE_CODES[objective]
+    loss_code = _LOSS_CODES[loss]
+    empty = np.empty(0)
+    weights, w_lo, w_hi = empty, empty, empty
+    if objective == "vega_weighted":
+        s = np.sqrt(np.maximum(w_target, 1e-16))
+        d1 = -k / s + 0.5 * s
+        weights = np.exp(-0.5 * d1 * d1)
+        mean_w = float(np.mean(weights))
+        weights = weights / mean_w if mean_w > 0 else np.ones_like(w_target)
+    elif objective == "bid_ask":
+        if "w_bid" not in kwargs or "w_ask" not in kwargs:
+            raise ValueError(
+                "objective='bid_ask' requires 'w_bid' and 'w_ask' kwargs: "
+                "total variance of the bid and ask quotes (iv_bid^2 T, iv_ask^2 T)"
+            )
+        w_lo = np.asarray(kwargs["w_bid"], dtype=np.float64)
+        w_hi = np.asarray(kwargs["w_ask"], dtype=np.float64)
+        if w_lo.shape != w_target.shape or w_hi.shape != w_target.shape:
+            raise ValueError("w_bid/w_ask must have the same shape as the quotes")
+    return mode, loss_code, weights, w_lo, w_hi
+
+
+def _mad_scale(k, w_model, w_target, mode, weights, w_lo, w_hi):
+    """1.4826 * MAD of the mode-space residuals at w_model.
+
+    Floored at 1e-6 of the data scale: on (near-)clean data the MAD
+    collapses to rounding noise, and an absolute-tiny f_scale would put
+    every residual on the loss plateau, degrading the optimizer. At the
+    relative floor the robust losses stay in their quadratic region and
+    behave like l2, which is the correct clean-data limit.
+    """
+    r = _kernels.resolve("residuals")(k, w_model, w_target, mode, weights, w_lo, w_hi)
+    mad = float(np.median(np.abs(r - np.median(r))))
+    floor = 1e-6 * float(np.median(np.abs(w_target))) if w_target.size else 0.0
+    return max(1.4826 * mad, floor, 1e-12)
+
+
+def _resolve_f_scale(kwargs, k, w0, w_target, mode, loss_code, weights, w_lo, w_hi,
+                     pilot=None):
+    """Robust-loss scale: explicit kwarg, else a data-driven default.
+
+    l2 needs no scale (1.0). For bid_ask the natural scale is the band
+    width. Otherwise the default is 1.4826 * MAD of the mode-space
+    residuals at a pilot l2 fit (so genuine outliers stand out against
+    the fitted noise level, not against initial-guess error); when the
+    pilot fails, the residuals at the initial guess w0 are used instead.
+    """
+    f_scale = kwargs.get("f_scale")
+    if f_scale is not None:
+        return float(f_scale)
+    if loss_code == _LOSS_CODES["l2"]:
+        return 1.0
+    if mode == _OBJECTIVE_CODES["bid_ask"]:
+        return max(float(np.median(w_hi - w_lo)), 1e-12)
+    if pilot is not None:
+        scale = pilot()
+        if scale is not None:
+            return scale
+    return _mad_scale(k, w0, w_target, mode, weights, w_lo, w_hi)
+
+
+def _initialization(kwargs, supports_jump_wings: bool = False) -> str:
+    """Validate the 'initialization' kwarg."""
+    init = kwargs.get("initialization", "default")
+    if init not in ("default", "jump_wings", "multi_start"):
+        raise ValueError(
+            f"unknown initialization {init!r}; choose 'default', 'jump_wings', "
+            "or 'multi_start'"
+        )
+    if init == "jump_wings" and not supports_jump_wings:
+        raise ValueError(
+            "initialization='jump_wings' is only available for SVI and NaturalSVI"
+        )
+    return init
+
+
+def _wing_readoff_x0(k, w_target):
+    """Data-driven raw-SVI start [a, b, rho, m, sigma] from ATM and wings.
+
+    Jump-wings-style readoff: wing slopes from least-squares fits to the
+    outer 20% of points on each side, skew from their asymmetry, vertex
+    from the minimum-variance strike.
+    """
+    order = np.argsort(k)
+    ks, ws = k[order], w_target[order]
+    n_wing = max(2, ks.size // 5)
+
+    def _slope(x, y):
+        xc = x - x.mean()
+        denom = float(np.sum(xc * xc))
+        return float(np.sum(xc * (y - y.mean())) / denom) if denom > 0 else 0.0
+
+    p_hat = max(-_slope(ks[:n_wing], ws[:n_wing]), 1e-4)   # put wing: w falls in k
+    c_hat = max(_slope(ks[-n_wing:], ws[-n_wing:]), 1e-4)  # call wing: w rises in k
+    b0 = 0.5 * (p_hat + c_hat)
+    rho0 = float(np.clip((c_hat - p_hat) / (c_hat + p_hat), -0.9, 0.9))
+    m0 = float(ks[int(np.argmin(ws))])
+    sigma0 = max(float(np.std(ks)) / 2.0, 0.05)
+    a0 = float(np.nanmin(ws)) - b0 * sigma0 * np.sqrt(1.0 - rho0 * rho0)
+    return np.array([a0, b0, rho0, m0, sigma0])
+
+
+def _multistart_variants(
+    x0, rho_idx, scale_idx,
+    rho_values=(-0.7, -0.3, 0.0, 0.3, 0.7),
+    scale_values=(0.5, 1.0, 2.0),
+):
+    """Deterministic start grid: the default start plus variations of the
+    skew-like coordinate and a width-like coordinate scaling."""
+    base = np.asarray(x0, dtype=np.float64)
+    starts = [base]
+    for rho in rho_values:
+        for sc in scale_values:
+            v = base.copy()
+            v[rho_idx] = rho
+            v[scale_idx] = base[scale_idx] * sc
+            starts.append(v)
+    return starts
+
+
+def _tight_if_controls(init, mode, loss_code):
+    """Tight L-BFGS-B options when any calibration control is active.
+
+    The legacy default path (total_variance / l2 / default start) keeps
+    scipy's default tolerances for backward-compatible fits; the new
+    residual spaces and robust losses produce objective values orders of
+    magnitude below scipy's relative ftol, and multi_start wants deep
+    convergence before comparing basins.
+    """
+    if init != "default" or mode != 0 or loss_code != 0:
+        return {"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000}
+    return None
+
+
+def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None, nm_options=None):
+    """L-BFGS-B from each start, keeping the best converged result.
+
+    Falls back to Nelder-Mead from the first start when no start
+    converges. Returns the scipy result, or None on total failure.
+    """
+    from scipy.optimize import minimize
+
+    best = None
+    for x0 in starts:
+        res = minimize(
+            objective, x0, method="L-BFGS-B", bounds=bounds,
+            options=lbfgs_options or {},
+        )
+        if res.success and (best is None or res.fun < best.fun):
+            best = res
+    if best is not None:
+        return best
+    res = minimize(
+        objective, starts[0], method="Nelder-Mead",
+        options=nm_options if nm_options is not None else {},
+    )
+    return res if res.success else None
+
+
 class Parametrization(ABC):
     """Base class for IV surface parametrizations."""
 
@@ -315,7 +596,22 @@ class Parametrization(ABC):
         w_target : np.ndarray
             Observed total variance values sigma_mkt^2 * T.
         **kwargs :
-            Extra model-specific arguments (e.g. theta for SSVI/eSSVI).
+            Extra model-specific arguments (e.g. theta for SSVI/eSSVI),
+            plus the common calibration controls accepted by every
+            iterative model:
+
+            * objective : str, default 'total_variance' — residual space:
+              'total_variance', 'implied_vol', 'price' (Black call),
+              'vega_weighted', or 'bid_ask' (requires 'w_bid'/'w_ask'
+              arrays, the total variance of the bid and ask quotes).
+            * loss : str, default 'l2' — 'l2', 'huber', 'soft_l1', or
+              'cauchy' (scipy.least_squares convention).
+            * f_scale : float, optional — robust-loss scale; defaults to
+              1.4826 * MAD of the residuals at a pilot l2 fit.
+            * initialization : str, default 'default' — 'default',
+              'jump_wings' (SVI/NaturalSVI only: data-driven wing
+              readoff), or 'multi_start' (deterministic start grid,
+              best converged result wins).
 
         Returns
         -------
@@ -348,6 +644,113 @@ class Parametrization(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__}.total_variance() must be implemented by subclasses."
         )
+
+    def _pilot_f_scale(self, k, w_target, kwargs, mode, weights, w_lo, w_hi):
+        """Robust-loss scale from a pilot l2 fit in the same residual space."""
+        pilot_kwargs = {
+            key: val for key, val in kwargs.items()
+            if key not in ("loss", "f_scale", "initialization")
+        }
+        pilot = self.calibrate(k, w_target, **pilot_kwargs)
+        if pilot is None:
+            return None
+        w_fit = self.total_variance(k, pilot)
+        return _mad_scale(k, w_fit, w_target, mode, weights, w_lo, w_hi)
+
+    #: Step for the default finite-difference derivatives (central,
+    #: second-order: truncation O(h^2), roundoff on w'' ~ eps/h^2). Set it
+    #: on an instance to trade truncation against roundoff; note the density
+    #: noise this induces for finite-difference models (SABR, DirectSVI) can
+    #: reach ~1e-2, far above the default diagnostics tolerance.
+    fd_step: float = 1e-5
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Total variance and its first two strike derivatives, (w, w', w'').
+
+        The base implementation uses central finite differences with step
+        :attr:`fd_step` on :meth:`total_variance`; parametrizations with
+        tractable analytic derivatives override it (SVI, SSVI, eSSVI,
+        jump-wings). SABR and DirectSVI use this finite-difference default.
+
+        Parameters
+        ----------
+        k : np.ndarray
+            Log-moneyness values log(K/F).
+        params : dict
+            Calibrated parameter dictionary for this parametrization.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            (w(k), w'(k), w''(k)).
+        """
+        k = np.asarray(k, dtype=np.float64)
+        h = self.fd_step
+        w = self.total_variance(k, params)
+        w_up = self.total_variance(k + h, params)
+        w_dn = self.total_variance(k - h, params)
+        dw = (w_up - w_dn) / (2.0 * h)
+        d2w = (w_up - 2.0 * w + w_dn) / (h * h)
+        return w, dw, d2w
+
+    def dw_dk(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """First derivative of total variance, w'(k). See :meth:`derivatives`."""
+        return self.derivatives(k, params)[1]
+
+    def d2w_dk2(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Second derivative of total variance, w''(k). See :meth:`derivatives`."""
+        return self.derivatives(k, params)[2]
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic total-variance wing slopes (left, right).
+
+        Returns lim dw/d(abs(k)) on each wing where a closed form exists
+        (the SVI family), else None — callers should fall back to
+        measuring dw/dk at finite k, which underestimates the asymptote
+        for convex w. Used by the Lee-bound check in the diagnostics.
+        """
+        return None
+
+    def density(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Risk-neutral density factor g(k).
+
+        ::
+
+            g(k) = (1 - k w'/(2w))^2 - (w')^2/4 (1/w + 1/4) + w''/2
+
+        The slice is free of butterfly arbitrage iff g(k) >= 0 for all k
+        [Gatheral & Jacquier 2014]. Uses :meth:`derivatives`, so models
+        with analytic derivatives get an analytic density. Only valid
+        where w(k) > 0; non-positive total variance produces NaN/inf or
+        meaningless values rather than raising — validate w separately
+        (the diagnostics module does).
+
+        Parameters
+        ----------
+        k : np.ndarray
+            Log-moneyness values log(K/F).
+        params : dict
+            Calibrated parameter dictionary for this parametrization.
+
+        Returns
+        -------
+        np.ndarray
+            g(k) at each input point.
+        """
+        k = np.asarray(k, dtype=np.float64)
+        w, dw, d2w = self.derivatives(k, params)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return _kernels.resolve("density_g")(k, w, dw, d2w)
 
 
 class SVI(Parametrization):
@@ -386,25 +789,30 @@ class SVI(Parametrization):
         Dict[str, float] or None
             {'a', 'b', 'rho', 'm', 'sigma'} or None (opt failed).
         """
-        from scipy.optimize import minimize
 
         k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
             _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
         )
+        mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("svi_obj")
 
         def objective(params):
             return core(
                 np.asarray(params, dtype=np.float64), k, w_target,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+                mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        a0 = float(np.nanmin(w_target))
-        spread = float(np.nanmax(w_target) - a0)
-        k_abs_max = float(np.max(np.abs(k)))
-        denom = max(k_abs_max, 1.0)
-        b0 = max(spread / denom, 1e-4)
-        x0 = np.array([a0, b0, 0.0, float(np.median(k)), max(float(np.std(k)), 0.1)])
+        init = _initialization(kwargs, supports_jump_wings=True)
+        if init == "jump_wings":
+            x0 = _wing_readoff_x0(k, w_target)
+        else:
+            a0 = float(np.nanmin(w_target))
+            spread = float(np.nanmax(w_target) - a0)
+            k_abs_max = float(np.max(np.abs(k)))
+            denom = max(k_abs_max, 1.0)
+            b0 = max(spread / denom, 1e-4)
+            x0 = np.array([a0, b0, 0.0, float(np.median(k)), max(float(np.std(k)), 0.1)])
 
         bounds = [
             (None, None),
@@ -414,14 +822,21 @@ class SVI(Parametrization):
             (1e-8, None),
         ]
 
-        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
-        if not res.success:
-            # Fallback Nelder-Mead
-            res = minimize(
-                objective, x0, method="Nelder-Mead", options={"maxiter": 2000}
-            )
-            if not res.success:
-                return None
+        f_scale = _resolve_f_scale(
+            kwargs, k, svi_total_variance(k, *x0), w_target,
+            mode, loss_code, weights, w_lo, w_hi,
+            pilot=lambda: self._pilot_f_scale(
+                k, w_target, kwargs, mode, weights, w_lo, w_hi
+            ),
+        )
+        starts = _multistart_variants(x0, 2, 4) if init == "multi_start" else [x0]
+        res = _minimize_with_starts(
+            objective, starts, bounds,
+            lbfgs_options=_tight_if_controls(init, mode, loss_code),
+            nm_options={"maxiter": 2000},
+        )
+        if res is None:
+            return None
 
         a, b, rho, m, sigma = res.x
         if b <= 0 or sigma <= 0 or abs(rho) >= 0.999:
@@ -441,6 +856,170 @@ class SVI(Parametrization):
         """Evaluate w(k) = a + b{ρ(k-m) + sqrt[(k-m)² + σ²]}."""
         svi_params = {p: params[p] for p in ["a", "b", "rho", "m", "sigma"]}
         return svi_total_variance(k, **svi_params)
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') for raw SVI."""
+        return _svi_derivatives(
+            _as_f64(k), params["a"], params["b"], params["rho"],
+            params["m"], params["sigma"],
+        )
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes: left b(1 - ρ), right b(1 + ρ)."""
+        b, rho = params["b"], params["rho"]
+        return b * (1.0 - rho), b * (1.0 + rho)
+
+
+class NaturalSVI(Parametrization):
+    """Natural SVI parametrization [Gatheral & Jacquier 2014].
+
+    ::
+
+        w(k) = Δ + ω/2 {1 + ζρ(k − μ) + sqrt[(ζ(k − μ) + ρ)² + (1 − ρ²)]}
+
+        Δ : vertical variance shift        (unconstrained)
+        μ : log-moneyness translation      (unconstrained)
+        ρ : skew (correlation)             abs(ρ) < 1
+        ω : overall variance scale         ω > 0
+        ζ : curvature / smile-width scale  ζ > 0
+
+    Same 5 degrees of freedom as raw SVI, connected by an explicit
+    bijection (:func:`natural_to_raw` / :func:`raw_to_natural`), but the
+    parameters map more directly to ATM level, skew, and curvature —
+    often better behaved in calibration and useful as an initialisation
+    coordinate system for raw SVI.
+
+    Calibrates via L-BFGS-B (bounded) → Nelder-Mead fallback; evaluation
+    and derivatives go through the raw-SVI equivalents.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/natural.html
+    """
+
+    def calibrate(
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
+    ) -> Optional[Dict[str, float]]:
+        """Minimize MSE(w_model(k), w_target) subject to constraints.
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness array.
+        w_target : NDArray[np.float64]
+            Market total variances σ_mkt²T.
+        **kwargs
+            Optional 'w_prev': prior slice total variance for calendar arb.
+
+        Returns
+        -------
+        Dict[str, float] or None
+            {'delta', 'mu', 'rho', 'omega', 'zeta'} or None (opt failed).
+        """
+
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
+        core = _kernels.resolve("natural_obj")
+
+        def objective(params):
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+                mode, weights, w_lo, w_hi, loss_code, f_scale,
+            )
+
+        init = _initialization(kwargs, supports_jump_wings=True)
+        if init == "jump_wings":
+            raw0 = _wing_readoff_x0(k, w_target)
+            nat0 = raw_to_natural(*raw0)
+            x0 = np.array([nat0["delta"], nat0["mu"], nat0["rho"],
+                           nat0["omega"], nat0["zeta"]])
+        else:
+            # Raw-SVI heuristics mapped through the bijection at rho = 0
+            # (zeta = 1/sigma, omega = 2 b sigma, mu = m, delta = a - b sigma)
+            a0 = float(np.nanmin(w_target))
+            spread = float(np.nanmax(w_target) - a0)
+            k_abs_max = float(np.max(np.abs(k)))
+            b0 = max(spread / max(k_abs_max, 1.0), 1e-4)
+            sigma0 = max(float(np.std(k)), 0.1)
+            x0 = np.array([
+                a0 - b0 * sigma0,             # delta
+                float(np.median(k)),          # mu
+                0.0,                          # rho
+                max(2.0 * b0 * sigma0, 1e-4), # omega
+                1.0 / sigma0,                 # zeta
+            ])
+
+        bounds = [
+            (None, None),      # delta
+            (None, None),      # mu
+            (-0.999, 0.999),   # abs(rho) < 1
+            (1e-8, None),      # omega > 0
+            (1e-8, None),      # zeta > 0
+        ]
+
+        f_scale = _resolve_f_scale(
+            kwargs, k, natural_total_variance(k, *x0), w_target,
+            mode, loss_code, weights, w_lo, w_hi,
+            pilot=lambda: self._pilot_f_scale(
+                k, w_target, kwargs, mode, weights, w_lo, w_hi
+            ),
+        )
+        starts = _multistart_variants(x0, 2, 4) if init == "multi_start" else [x0]
+        # Tight ftol/gtol as for SABR: total-variance MSEs are O(1e-8) even
+        # mid-fit, so scipy's default relative ftol stops too early.
+        res = _minimize_with_starts(
+            objective, starts, bounds,
+            lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+            nm_options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+        )
+        if res is None:
+            return None
+
+        delta, mu, rho, omega, zeta = res.x
+        if omega <= 0 or zeta <= 0 or abs(rho) >= 0.999:
+            return None
+
+        return {
+            "delta": float(delta),
+            "mu": float(mu),
+            "rho": float(rho),
+            "omega": float(omega),
+            "zeta": float(zeta),
+        }
+
+    def total_variance(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Evaluate natural SVI w(k) via the raw-SVI equivalents."""
+        return natural_total_variance(
+            k, params["delta"], params["mu"], params["rho"],
+            params["omega"], params["zeta"],
+        )
+
+    @staticmethod
+    def _raw_svi(params: Dict[str, float]) -> tuple[float, float, float, float, float]:
+        return _kernels.resolve("natural_convert")(
+            params["delta"], params["mu"], params["rho"],
+            params["omega"], params["zeta"],
+        )
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') via the raw-SVI equivalent parameters."""
+        return _svi_derivatives(_as_f64(k), *self._raw_svi(params))
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes via the raw-SVI equivalents: b(1 ∓ ρ)."""
+        _, b, rho, _, _ = self._raw_svi(params)
+        return b * (1.0 - rho), b * (1.0 + rho)
 
 
 class SSVI(Parametrization):
@@ -479,27 +1058,39 @@ class SSVI(Parametrization):
             {'rho', 'eta', 'theta'} or None.
         """
         theta = float(kwargs["theta"])
-        from scipy.optimize import minimize
 
         k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
             _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
         )
+        mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("ssvi_obj")
 
         def objective(params):
             return core(
                 np.asarray(params, dtype=np.float64), k, w_target, theta,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+                mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
+        init = _initialization(kwargs)
         x0 = np.array([0.0, 1.0])
         bounds = [(-0.999, 0.999), (1e-8, None)]
 
-        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
-        if not res.success:
-            res = minimize(objective, x0, method="Nelder-Mead")
-            if not res.success:
-                return None
+        f_scale = _resolve_f_scale(
+            kwargs, k,
+            ssvi_total_variance(k, theta, x0[0], x0[1] / np.sqrt(theta)),
+            w_target, mode, loss_code, weights, w_lo, w_hi,
+            pilot=lambda: self._pilot_f_scale(
+                k, w_target, kwargs, mode, weights, w_lo, w_hi
+            ),
+        )
+        starts = _multistart_variants(x0, 0, 1) if init == "multi_start" else [x0]
+        res = _minimize_with_starts(
+            objective, starts, bounds,
+            lbfgs_options=_tight_if_controls(init, mode, loss_code),
+        )
+        if res is None:
+            return None
 
         rho, eta = res.x
         if eta <= 0 or abs(rho) >= 0.999:
@@ -513,6 +1104,23 @@ class SSVI(Parametrization):
         theta = params["theta"]
         phi_theta = params["eta"] / np.sqrt(theta)
         return ssvi_total_variance(k, theta, params["rho"], phi_theta)
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') for SSVI."""
+        theta = params["theta"]
+        return _ssvi_derivatives(
+            _as_f64(k), theta, params["rho"], params["eta"] / np.sqrt(theta)
+        )
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes: θφ(1 ∓ ρ)/2."""
+        theta, rho = params["theta"], params["rho"]
+        phi = params["eta"] / np.sqrt(theta)
+        return 0.5 * theta * phi * (1.0 - rho), 0.5 * theta * phi * (1.0 + rho)
 
 
 class ESSVI(Parametrization):
@@ -556,7 +1164,6 @@ class ESSVI(Parametrization):
         theta = float(kwargs["theta"])
         theta_ref = kwargs["theta_ref"]
 
-        from scipy.optimize import minimize
 
         if theta_ref is None:
             theta_ref = theta
@@ -565,29 +1172,42 @@ class ESSVI(Parametrization):
         k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
             _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
         )
+        mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("essvi_obj")
 
         def objective(params):
             return core(
                 np.asarray(params, dtype=np.float64), k, w_target, theta, theta_ref,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+                mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
+        init = _initialization(kwargs)
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
         bounds = [(-0.999, 0.999), (-2.0, 2.0), (-2.0, 2.0), (1e-8, None)]
 
-        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
-        if not res.success:
-            res = minimize(objective, x0, method="Nelder-Mead")
-            if not res.success:
-                return None
+        rho_init = self._rho_of(theta, theta_ref, x0[0], x0[1], x0[2])
+        f_scale = _resolve_f_scale(
+            kwargs, k,
+            essvi_total_variance(k, theta, rho_init, x0[3] / np.sqrt(theta)),
+            w_target, mode, loss_code, weights, w_lo, w_hi,
+            pilot=lambda: self._pilot_f_scale(
+                k, w_target, kwargs, mode, weights, w_lo, w_hi
+            ),
+        )
+        starts = _multistart_variants(x0, 0, 3) if init == "multi_start" else [x0]
+        res = _minimize_with_starts(
+            objective, starts, bounds,
+            lbfgs_options=_tight_if_controls(init, mode, loss_code),
+        )
+        if res is None:
+            return None
 
         rho0, rho1, alpha, eta = res.x
         if eta <= 0:
             return None
 
-        theta_ratio = theta / max(theta_ref, 1e-12)
-        rho_theta = np.clip(rho0 + rho1 * (theta_ratio**alpha), -0.999, 0.999)
+        rho_theta = self._rho_of(theta, theta_ref, rho0, rho1, alpha)
 
         return {
             "rho0": float(rho0),
@@ -599,19 +1219,55 @@ class ESSVI(Parametrization):
             "rho_theta": float(rho_theta),
         }
 
+    @staticmethod
+    def _rho_of(
+        theta: float, theta_ref: float, rho0: float, rho1: float, alpha: float
+    ) -> float:
+        """The ρ(θ) term structure: clip(ρ₀ + ρ₁(θ/θ_ref)^α, ±0.999)."""
+        ratio = theta / max(theta_ref, 1e-12)
+        return float(np.clip(rho0 + rho1 * ratio**alpha, -0.999, 0.999))
+
+    @staticmethod
+    def _rho_phi(params: Dict[str, float]) -> tuple[float, float, float]:
+        """Resolve (theta, rho(theta), phi(theta)) from a params dict.
+
+        A stored ``rho_theta`` takes precedence and suffices on its own;
+        otherwise it is computed from (rho0, rho1, alpha, theta_ref).
+        """
+        theta = params["theta"]
+        rho_theta = params.get("rho_theta")
+        if rho_theta is None:
+            rho_theta = ESSVI._rho_of(
+                theta, params["theta_ref"],
+                params["rho0"], params["rho1"], params["alpha"],
+            )
+        else:
+            rho_theta = float(np.clip(rho_theta, -0.999, 0.999))
+        phi_theta = params["eta"] / np.sqrt(theta)
+        return theta, rho_theta, phi_theta
+
     def total_variance(
         self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> NDArray[np.float64]:
-        theta = params["theta"]
-        rho_theta = params.get(
-            "rho_theta",
-            params["rho0"]
-            + params["rho1"]
-            * (theta / max(params["theta_ref"], 1e-12)) ** params["alpha"],
-        )
-        rho_theta = np.clip(rho_theta, -0.999, 0.999)
-        phi_theta = params["eta"] / np.sqrt(theta)
+        theta, rho_theta, phi_theta = self._rho_phi(params)
         return essvi_total_variance(k, theta, rho_theta, phi_theta)
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') for eSSVI (SSVI form with ρ(θ))."""
+        theta, rho_theta, phi_theta = self._rho_phi(params)
+        return _ssvi_derivatives(_as_f64(k), theta, rho_theta, phi_theta)
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes: θφ(1 ∓ ρ(θ))/2."""
+        theta, rho_theta, phi_theta = self._rho_phi(params)
+        return (
+            0.5 * theta * phi_theta * (1.0 - rho_theta),
+            0.5 * theta * phi_theta * (1.0 + rho_theta),
+        )
 
 
 class JumpWings(Parametrization):
@@ -652,19 +1308,21 @@ class JumpWings(Parametrization):
             {'v_t', 'psi_t', 'p_t', 'c_t', 'v_tilde_t', 'T'} or None.
         """
         T = float(kwargs["T"])
-        from scipy.optimize import minimize
 
         k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
             _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
         )
+        mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("jw_obj")
 
         def objective(params):
             return core(
                 np.asarray(params, dtype=np.float64), k, w_target, T,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+                mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
+        init = _initialization(kwargs)
         # Initial guess from market data
         v_t0 = float(np.interp(0.0, k, w_target)) / T if T > 0 else 0.04
         v_tilde_t0 = float(np.nanmin(w_target)) / T if T > 0 else 0.03
@@ -678,11 +1336,25 @@ class JumpWings(Parametrization):
             (1e-8, None),     # v_tilde_t > 0
         ]
 
-        res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
-        if not res.success:
-            res = minimize(objective, x0, method="Nelder-Mead", options={"maxiter": 2000})
-            if not res.success:
-                return None
+        f_scale = _resolve_f_scale(
+            kwargs, k,
+            jw_total_variance(k, x0[0], x0[1], x0[2], x0[3], x0[4], T),
+            w_target, mode, loss_code, weights, w_lo, w_hi,
+            pilot=lambda: self._pilot_f_scale(
+                k, w_target, kwargs, mode, weights, w_lo, w_hi
+            ),
+        )
+        starts = (
+            _multistart_variants(x0, 1, 2, rho_values=(-0.5, -0.2, 0.0, 0.2, 0.5))
+            if init == "multi_start" else [x0]
+        )
+        res = _minimize_with_starts(
+            objective, starts, bounds,
+            lbfgs_options=_tight_if_controls(init, mode, loss_code),
+            nm_options={"maxiter": 2000},
+        )
+        if res is None:
+            return None
 
         v_t, psi_t, p_t, c_t, v_tilde_t = res.x
         if v_t <= 0 or v_tilde_t <= 0 or p_t < 0 or c_t < 0:
@@ -705,6 +1377,43 @@ class JumpWings(Parametrization):
             k, params["v_t"], params["psi_t"], params["p_t"],
             params["c_t"], params["v_tilde_t"], params["T"],
         )
+
+    @staticmethod
+    def _raw_svi(params: Dict[str, float]) -> Optional[tuple[float, float, float, float, float]]:
+        """Jump-wings → raw SVI (a, b, rho, m, sigma); None for a flat slice.
+
+        Delegates to the shared jw_convert kernel — the single source used
+        by evaluation and the calibration objectives.
+        """
+        ok, a, b, rho, m, sigma = _kernels.resolve("jw_convert")(
+            params["v_t"], params["psi_t"], params["p_t"],
+            params["c_t"], params["v_tilde_t"], params["T"],
+        )
+        if not ok:
+            return None  # degenerate: w(k) = v_t * T for all k
+        return a, b, rho, m, sigma
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') via the raw-SVI equivalent parameters."""
+        k = _as_f64(k)
+        raw = self._raw_svi(params)
+        if raw is None:
+            w = np.full_like(k, params["v_t"] * params["T"])
+            zero = np.zeros_like(k)
+            return w, zero, zero.copy()
+        return _svi_derivatives(k, *raw)
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes via the raw-SVI equivalents: b(1 ∓ ρ)."""
+        raw = self._raw_svi(params)
+        if raw is None:
+            return 0.0, 0.0
+        _, b, rho, _, _ = raw
+        return b * (1.0 - rho), b * (1.0 + rho)
 
 
 def directsvi_fit(
@@ -922,19 +1631,21 @@ class SABR(Parametrization):
         if T <= 0 or F <= 0:
             raise ValueError(f"SABR requires T > 0 and F > 0, got T={T}, F={F}")
 
-        from scipy.optimize import minimize
 
         k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
             _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
         )
+        mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("sabr_obj")
 
         def objective(params):
             return core(
                 np.asarray(params, dtype=np.float64), k, w_target, beta, F, T,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+                mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
+        init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
         w_atm = float(np.interp(0.0, k, w_target))
         sigma_atm = np.sqrt(max(w_atm, 1e-12) / T)
@@ -947,19 +1658,24 @@ class SABR(Parametrization):
             (0.0, None),       # nu >= 0
         ]
 
+        f_scale = _resolve_f_scale(
+            kwargs, k,
+            sabr_total_variance(k, x0[0], beta, x0[1], x0[2], F, T),
+            w_target, mode, loss_code, weights, w_lo, w_hi,
+            pilot=lambda: self._pilot_f_scale(
+                k, w_target, kwargs, mode, weights, w_lo, w_hi
+            ),
+        )
+        starts = _multistart_variants(x0, 1, 2) if init == "multi_start" else [x0]
         # Tight ftol/gtol: total-variance MSEs are O(1e-8) even mid-fit, so
         # scipy's default relative ftol would declare convergence too early.
-        res = minimize(
-            objective, x0, method="L-BFGS-B", bounds=bounds,
-            options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+        res = _minimize_with_starts(
+            objective, starts, bounds,
+            lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+            nm_options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
         )
-        if not res.success:
-            res = minimize(
-                objective, x0, method="Nelder-Mead",
-                options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
-            )
-            if not res.success:
-                return None
+        if res is None:
+            return None
 
         alpha, rho, nu = res.x
         if alpha <= 0 or abs(rho) >= 0.999 or nu < 0:

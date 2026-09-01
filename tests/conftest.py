@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 
 # src/pysvi absolute imports (tests/ and src/ siblings)
 from src.pysvi.models import (
-    SVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
+    SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
     svi_total_variance
 )
 from src.pysvi.calibration import (
@@ -51,6 +51,29 @@ def atm_slice() -> pd.DataFrame:
         "maturity": T,
         "implied_forward": F
     })
+
+
+# Flat rate used to build the surface_df forwards and to price in the
+# surface tests — defined once so fixture and assertions cannot drift.
+SURFACE_RATE = 0.02
+
+
+@pytest.fixture
+def surface_df() -> pd.DataFrame:
+    """Three-maturity synthetic panel: flat vol term structure, F = 100 e^{rT}."""
+    np.random.seed(7)
+    rows = []
+    base = {"a": 0.01, "b": 0.12, "rho": -0.6, "m": 0.01, "sigma": 0.25}
+    for T in (0.25, 0.5, 1.0):
+        F = 100.0 * np.exp(SURFACE_RATE * T)
+        k = np.linspace(-0.25, 0.25, 21)
+        w = svi_total_variance(k, **base) * (T / 0.25)  # calendar-monotone
+        iv = np.sqrt(w / T) + 0.0002 * np.random.randn(k.size)
+        rows.append(pd.DataFrame({
+            "strike": F * np.exp(k), "iv": iv,
+            "maturity": T, "implied_forward": F,
+        }))
+    return pd.concat(rows, ignore_index=True)
 
 
 def _valid_slice_for_prepare() -> pd.DataFrame:
@@ -107,6 +130,19 @@ def calibrated_svi(atm_slice, backend_mode) -> Tuple[SVI, pd.DataFrame, Dict[str
     params = calibrate_slice(df_slice, model)
     assert params is not None
     assert all(params[k] > 0 for k in ["a", "b", "sigma"])
+    assert abs(params["rho"]) < 0.999
+    return model, df_slice, params
+
+
+@pytest.fixture
+def natural_calibrated(atm_slice, backend_mode) -> Tuple[NaturalSVI, pd.DataFrame, Dict[str, float]]:
+    """NaturalSVI + slice + guaranteed calibration."""
+    df_slice = atm_slice
+    model = cast(NaturalSVI, get_model("natural"))
+    params = calibrate_slice(df_slice, model)
+    assert params is not None
+    assert params["omega"] > 0
+    assert params["zeta"] > 0
     assert abs(params["rho"]) < 0.999
     return model, df_slice, params
 

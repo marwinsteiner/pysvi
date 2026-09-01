@@ -16,3 +16,19 @@
    :undoc-members:
    :show-inheritance:
 ```
+
+## Surface
+
+```{eval-rst}
+.. automodule:: pysvi.surface
+   :members:
+   :show-inheritance:
+```
+
+## Diagnostics
+
+```{eval-rst}
+.. automodule:: pysvi.diagnostics
+   :members:
+   :show-inheritance:
+```
