@@ -17,7 +17,7 @@ from .calibration import (prepare_slice, calibrate_slice, apply_slice,
                          calculate_implied_forward, get_model)
 from .diagnostics import (check_slice_arbitrage, check_arbitrage,
                           SliceArbitrageReport, ArbitrageReport, LEE_BOUND)
-from .surface import VolSurface
+from .surface import VolSurface, calibrate_surface
 
 __all__ = [
     "SVI", "NaturalSVI", "SSVI", "ESSVI", "JumpWings", "DirectSVI", "SABR",
@@ -29,6 +29,6 @@ __all__ = [
     "use_numba", "numba_available",
     "check_slice_arbitrage", "check_arbitrage",
     "SliceArbitrageReport", "ArbitrageReport", "LEE_BOUND",
-    "VolSurface",
+    "VolSurface", "calibrate_surface",
     "prepare_slice", "calibrate_slice", "apply_slice", "calculate_implied_forward"
 ]
