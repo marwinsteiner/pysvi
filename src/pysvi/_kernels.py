@@ -22,6 +22,7 @@ backend at the level of floating-point rounding (~1e-15 relative), far below
 calibration noise.
 """
 
+import math
 import os
 
 import numpy as np
@@ -137,10 +138,176 @@ def ssvi_derivs(k, theta, rho, phi):
     return w, dw, d2w
 
 
-def butterfly_penalty(k, w, dw, d2w):
-    g = (1.0 - k * dw / (2.0 * w)) ** 2 - (dw**2) / 4.0 * (1.0 / w + 0.25) + d2w / 2.0
-    violations = np.maximum(-g, 0.0)
-    return np.sum(violations**2)
+def density_g(k, w, dw, d2w):
+    """Butterfly density factor g(k); valid only where w > 0."""
+    return (1.0 - k * dw / (2.0 * w)) ** 2 - (dw**2) / 4.0 * (1.0 / w + 0.25) + d2w / 2.0
+
+
+def jw_convert(v_t, psi_t, p_t, c_t, v_tilde_t, T):
+    """Jump-wings -> raw SVI: (ok, a, b, rho, m, sigma).
+
+    ok=False marks the degenerate flat slice (b ~ 0), where w(k) = v_t * T.
+    Single source for the conversion used by evaluation, calibration
+    objectives, and the analytic-derivative path.
+    """
+    b = (p_t + c_t) / 2.0
+    if b < 1e-12:
+        return False, 0.0, 0.0, 0.0, 0.0, 0.0
+    rho = 1.0 - p_t / b
+    beta = rho - 2.0 * psi_t * np.sqrt(T) / b
+    if beta > 0.9999:
+        beta = 0.9999
+    elif beta < -0.9999:
+        beta = -0.9999
+    if abs(beta) < 1e-12:
+        alpha = 0.0
+    else:
+        sign_beta = 1.0 if beta > 0.0 else -1.0
+        alpha = sign_beta * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
+    sign_alpha = 1.0 if alpha > 0.0 else (-1.0 if alpha < 0.0 else 0.0)
+    denom = (
+        -rho
+        + sign_alpha * np.sqrt(1.0 + alpha * alpha)
+        - alpha * np.sqrt(1.0 - rho * rho)
+    )
+    if abs(denom) < 1e-12:
+        m = 0.0
+    else:
+        m = (v_t - v_tilde_t) * T / (b * denom)
+    sigma = max(abs(alpha * m), 1e-12)
+    a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho * rho)
+    return True, a, b, rho, m, sigma
+
+
+def natural_convert(delta, mu, rho, omega, zeta):
+    """Natural SVI -> raw SVI (a, b, rho, m, sigma).
+
+    [Gatheral & Jacquier 2014, eq. 3.2]: the bijection
+    a = delta + omega(1 - rho^2)/2, b = omega*zeta/2,
+    m = mu - rho/zeta, sigma = sqrt(1 - rho^2)/zeta.
+    Requires zeta > 0 and abs(rho) < 1.
+    """
+    a = delta + 0.5 * omega * (1.0 - rho * rho)
+    b = 0.5 * omega * zeta
+    m = mu - rho / zeta
+    sigma = np.sqrt(1.0 - rho * rho) / zeta
+    return a, b, rho, m, sigma
+
+
+def make_natural_w(svi_w_fn, convert_fn):
+    def natural_w(k, delta, mu, rho, omega, zeta):
+        a, b, rho_r, m, sigma = convert_fn(delta, mu, rho, omega, zeta)
+        return svi_w_fn(k, a, b, rho_r, m, sigma)
+
+    return natural_w
+
+
+def ncdf(x):
+    """Standard normal CDF (scalar)."""
+    return 0.5 * (1.0 + math.erf(x / 1.4142135623730951))
+
+
+def make_black_call(ncdf_fn):
+    def black_call(k_i, w):
+        """Forward-normalized undiscounted Black call price at log-moneyness k_i.
+
+        C/F with K/F = exp(k_i) and total variance w; intrinsic for w <= 0.
+        """
+        if w <= 0.0:
+            payoff = 1.0 - np.exp(k_i)
+            return payoff if payoff > 0.0 else 0.0
+        s = np.sqrt(w)
+        d1 = -k_i / s + 0.5 * s
+        return ncdf_fn(d1) - np.exp(k_i) * ncdf_fn(d1 - s)
+
+    return black_call
+
+
+# Residual-space codes shared with models._OBJECTIVE_CODES:
+#   0 total_variance, 1 implied_vol (total-vol space), 2 price (Black call),
+#   3 vega_weighted (weights precomputed python-side), 4 bid_ask band.
+# Loss codes shared with models._LOSS_CODES: 0 l2, 1 huber, 2 soft_l1, 3 cauchy.
+
+
+def make_point_residual(black_fn):
+    def point_residual(k_i, wm, wt, mode, weight_i, lo_i, hi_i):
+        if mode == 0:
+            return wm - wt
+        elif mode == 1:
+            s_m = np.sqrt(wm) if wm > 0.0 else 0.0
+            s_t = np.sqrt(wt) if wt > 0.0 else 0.0
+            return s_m - s_t
+        elif mode == 2:
+            return black_fn(k_i, wm) - black_fn(k_i, wt)
+        elif mode == 3:
+            s_m = np.sqrt(wm) if wm > 0.0 else 0.0
+            s_t = np.sqrt(wt) if wt > 0.0 else 0.0
+            return weight_i * (s_m - s_t)
+        else:  # 4: zero inside the [lo, hi] band, distance outside
+            if wm < lo_i:
+                return lo_i - wm
+            elif wm > hi_i:
+                return wm - hi_i
+            return 0.0
+
+    return point_residual
+
+
+def make_residuals(point_residual_fn):
+    def residuals(k, w_model, w_target, mode, weights, w_lo, w_hi):
+        n = k.shape[0]
+        out = np.empty(n)
+        for i in range(n):
+            weight_i = weights[i] if weights.shape[0] == n else 1.0
+            lo_i = w_lo[i] if w_lo.shape[0] == n else 0.0
+            hi_i = w_hi[i] if w_hi.shape[0] == n else 0.0
+            out[i] = point_residual_fn(
+                k[i], w_model[i], w_target[i], mode, weight_i, lo_i, hi_i
+            )
+        return out
+
+    return residuals
+
+
+def make_loss_value(point_residual_fn):
+    def loss_value(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale):
+        """Mean robust loss over residuals in the selected space.
+
+        scipy.least_squares convention: contribution = f_scale^2 * rho(r/f_scale),
+        so loss_code 0 with f_scale 1 reproduces the plain MSE.
+        """
+        n = k.shape[0]
+        total = 0.0
+        for i in range(n):
+            weight_i = weights[i] if weights.shape[0] == n else 1.0
+            lo_i = w_lo[i] if w_lo.shape[0] == n else 0.0
+            hi_i = w_hi[i] if w_hi.shape[0] == n else 0.0
+            r = point_residual_fn(
+                k[i], w_model[i], w_target[i], mode, weight_i, lo_i, hi_i
+            )
+            u = r / f_scale
+            if loss_code == 0:
+                rho = u * u
+            elif loss_code == 1:  # huber
+                au = abs(u)
+                rho = u * u if au <= 1.0 else 2.0 * au - 1.0
+            elif loss_code == 2:  # soft_l1
+                rho = 2.0 * (np.sqrt(1.0 + u * u) - 1.0)
+            else:  # cauchy
+                rho = np.log(1.0 + u * u)
+            total += rho
+        return (f_scale * f_scale) * total / n
+
+    return loss_value
+
+
+def make_butterfly_penalty(density_g_fn):
+    def butterfly_penalty(k, w, dw, d2w):
+        g = density_g_fn(k, w, dw, d2w)
+        violations = np.maximum(-g, 0.0)
+        return np.sum(violations**2)
+
+    return butterfly_penalty
 
 
 def calendar_penalty(w_current, w_prev):
@@ -176,41 +343,19 @@ def finite_diff(x, w):
 # instantiated against plain or jitted leaves.
 
 
-def make_jw_w(svi_w_fn):
+def make_jw_w(svi_w_fn, convert_fn):
     def jw_w(k, v_t, psi_t, p_t, c_t, v_tilde_t, T):
-        b = (p_t + c_t) / 2.0
-        if b < 1e-12:
+        ok, a, b, rho, m, sigma = convert_fn(v_t, psi_t, p_t, c_t, v_tilde_t, T)
+        if not ok:
             return np.full_like(k, v_t * T)
-        rho = 1.0 - p_t / b
-        beta = rho - 2.0 * psi_t * np.sqrt(T) / b
-        if beta > 0.9999:
-            beta = 0.9999
-        elif beta < -0.9999:
-            beta = -0.9999
-        if abs(beta) < 1e-12:
-            alpha = 0.0
-        else:
-            sign_beta = 1.0 if beta > 0.0 else -1.0
-            alpha = sign_beta * np.sqrt(max(1.0 / (beta * beta) - 1.0, 0.0))
-        sign_alpha = 1.0 if alpha > 0.0 else (-1.0 if alpha < 0.0 else 0.0)
-        denom = (
-            -rho
-            + sign_alpha * np.sqrt(1.0 + alpha * alpha)
-            - alpha * np.sqrt(1.0 - rho * rho)
-        )
-        if abs(denom) < 1e-12:
-            m = 0.0
-        else:
-            m = (v_t - v_tilde_t) * T / (b * denom)
-        sigma = max(abs(alpha * m), 1e-12)
-        a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho * rho)
         return svi_w_fn(k, a, b, rho, m, sigma)
 
     return jw_w
 
 
-def make_svi_objective(svi_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
-    def objective(p, k, w_target, k_grid, w_prev, check_bf, check_cal, has_prev):
+def make_svi_objective(svi_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn, loss_fn):
+    def objective(p, k, w_target, k_grid, w_prev, check_bf, check_cal, has_prev,
+                  mode, weights, w_lo, w_hi, loss_code, f_scale):
         a, b, rho, m, sigma = p[0], p[1], p[2], p[3], p[4]
         penalty = 0.0
         if b <= 0.0:
@@ -220,7 +365,7 @@ def make_svi_objective(svi_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
         if sigma <= 0.0:
             penalty += 1e6 * (1.0 - sigma) ** 2
         w_model = svi_w_fn(k, a, b, rho, m, sigma)
-        mse = np.mean((w_target - w_model) ** 2)
+        mse = loss_fn(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale)
         if (check_bf or check_cal) and b > 0.0 and sigma > 0.0:
             w_g = svi_w_fn(k_grid, a, b, rho, m, sigma)
             if check_bf:
@@ -233,9 +378,41 @@ def make_svi_objective(svi_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
     return objective
 
 
-def make_ssvi_objective(ssvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn):
+def make_natural_objective(natural_w_fn, convert_fn, svi_derivs_fn, butterfly_fn, calendar_fn, loss_fn):
+    def objective(p, k, w_target, k_grid, w_prev, check_bf, check_cal, has_prev,
+                  mode, weights, w_lo, w_hi, loss_code, f_scale):
+        delta, mu, rho, omega, zeta = p[0], p[1], p[2], p[3], p[4]
+        penalty = 0.0
+        if omega <= 0.0:
+            penalty += 1e6 * (1.0 - omega) ** 2
+        if abs(rho) >= 0.999:
+            penalty += 1e6 * (abs(rho) - 0.999) ** 2
+            if rho > 0.998:
+                rho = 0.998
+            elif rho < -0.998:
+                rho = -0.998
+        if zeta <= 0.0:
+            penalty += 1e6 * (1.0 - zeta) ** 2
+            zeta = 1e-8
+        w_model = natural_w_fn(k, delta, mu, rho, omega, zeta)
+        mse = loss_fn(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale)
+        if (check_bf or check_cal) and omega > 0.0:
+            w_g = natural_w_fn(k_grid, delta, mu, rho, omega, zeta)
+            if check_bf:
+                a, b, rho_r, m, sigma = convert_fn(delta, mu, rho, omega, zeta)
+                _, dw_g, d2w_g = svi_derivs_fn(k_grid, a, b, rho_r, m, sigma)
+                penalty += 1e4 * butterfly_fn(k_grid, w_g, dw_g, d2w_g)
+            if check_cal and has_prev:
+                penalty += 1e4 * calendar_fn(w_g, w_prev)
+        return mse + penalty
+
+    return objective
+
+
+def make_ssvi_objective(ssvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn, loss_fn):
     def objective(
-        p, k, w_target, theta, k_grid, w_prev, check_bf, check_cal, has_prev
+        p, k, w_target, theta, k_grid, w_prev, check_bf, check_cal, has_prev,
+        mode, weights, w_lo, w_hi, loss_code, f_scale,
     ):
         rho, eta = p[0], p[1]
         penalty = 0.0
@@ -245,7 +422,7 @@ def make_ssvi_objective(ssvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn):
             penalty += 1e6 * (1.0 - eta) ** 2
         phi = eta / np.sqrt(theta)
         w_model = ssvi_w_fn(k, theta, rho, phi)
-        mse = np.mean((w_target - w_model) ** 2)
+        mse = loss_fn(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale)
         if (check_bf or check_cal) and eta > 0.0:
             w_g = ssvi_w_fn(k_grid, theta, rho, phi)
             if check_bf:
@@ -258,10 +435,11 @@ def make_ssvi_objective(ssvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn):
     return objective
 
 
-def make_essvi_objective(essvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn):
+def make_essvi_objective(essvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn, loss_fn):
     def objective(
         p, k, w_target, theta, theta_ref, k_grid, w_prev,
         check_bf, check_cal, has_prev,
+        mode, weights, w_lo, w_hi, loss_code, f_scale,
     ):
         rho0, rho1, alpha, eta = p[0], p[1], p[2], p[3]
         penalty = 0.0
@@ -275,7 +453,7 @@ def make_essvi_objective(essvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn):
             rho_theta = -0.999
         phi = eta / np.sqrt(theta)
         w_model = essvi_w_fn(k, theta, rho_theta, phi)
-        mse = np.mean((w_target - w_model) ** 2)
+        mse = loss_fn(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale)
         penalty += 1e2 * max(0.0, abs(rho_theta) - 0.95)
         if (check_bf or check_cal) and eta > 0.0:
             w_g = essvi_w_fn(k_grid, theta, rho_theta, phi)
@@ -289,9 +467,10 @@ def make_essvi_objective(essvi_w_fn, ssvi_derivs_fn, butterfly_fn, calendar_fn):
     return objective
 
 
-def make_jw_objective(jw_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
+def make_jw_objective(jw_w_fn, convert_fn, svi_derivs_fn, butterfly_fn, calendar_fn, loss_fn):
     def objective(
-        p, k, w_target, T, k_grid, w_prev, check_bf, check_cal, has_prev
+        p, k, w_target, T, k_grid, w_prev, check_bf, check_cal, has_prev,
+        mode, weights, w_lo, w_hi, loss_code, f_scale,
     ):
         v_t, psi_t, p_t, c_t, v_tilde_t = p[0], p[1], p[2], p[3], p[4]
         penalty = 0.0
@@ -306,7 +485,7 @@ def make_jw_objective(jw_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
         if v_tilde_t > v_t:
             penalty += 1e4 * (v_tilde_t - v_t) ** 2
         w_model = jw_w_fn(k, v_t, psi_t, p_t, c_t, v_tilde_t, T)
-        mse = np.mean((w_target - w_model) ** 2)
+        mse = loss_fn(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale)
         if (
             (check_bf or check_cal)
             and v_t > 0.0
@@ -316,32 +495,10 @@ def make_jw_objective(jw_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
         ):
             w_g = jw_w_fn(k_grid, v_t, psi_t, p_t, c_t, v_tilde_t, T)
             if check_bf:
-                b = (p_t + c_t) / 2.0
-                if b > 1e-12:
-                    rho = 1.0 - p_t / b
-                    beta = rho - 2.0 * psi_t * np.sqrt(T) / b
-                    if beta > 0.9999:
-                        beta = 0.9999
-                    elif beta < -0.9999:
-                        beta = -0.9999
-                    sign_beta = 1.0 if beta > 0.0 else (-1.0 if beta < 0.0 else 0.0)
-                    alpha_jw = sign_beta * np.sqrt(
-                        max(1.0 / (beta * beta) - 1.0, 0.0)
-                    )
-                    sign_alpha = (
-                        1.0 if alpha_jw > 0.0 else (-1.0 if alpha_jw < 0.0 else 0.0)
-                    )
-                    denom = (
-                        -rho
-                        + sign_alpha * np.sqrt(1.0 + alpha_jw**2)
-                        - alpha_jw * np.sqrt(1.0 - rho**2)
-                    )
-                    if abs(denom) > 1e-12:
-                        m = (v_t - v_tilde_t) * T / (b * denom)
-                    else:
-                        m = 0.0
-                    sigma = max(abs(alpha_jw * m), 1e-12)
-                    a = v_tilde_t * T - b * sigma * np.sqrt(1.0 - rho**2)
+                ok, a, b, rho, m, sigma = convert_fn(
+                    v_t, psi_t, p_t, c_t, v_tilde_t, T
+                )
+                if ok:
                     _, dw_g, d2w_g = svi_derivs_fn(k_grid, a, b, rho, m, sigma)
                     penalty += 1e4 * butterfly_fn(k_grid, w_g, dw_g, d2w_g)
             if check_cal and has_prev:
@@ -351,10 +508,11 @@ def make_jw_objective(jw_w_fn, svi_derivs_fn, butterfly_fn, calendar_fn):
     return objective
 
 
-def make_sabr_objective(sabr_vol_fn, finite_diff_fn, butterfly_fn, calendar_fn):
+def make_sabr_objective(sabr_vol_fn, finite_diff_fn, butterfly_fn, calendar_fn, loss_fn):
     def objective(
         p, k, w_target, beta, F, T, k_grid, w_prev,
         check_bf, check_cal, has_prev,
+        mode, weights, w_lo, w_hi, loss_code, f_scale,
     ):
         alpha, rho, nu = p[0], p[1], p[2]
         penalty = 0.0
@@ -372,7 +530,7 @@ def make_sabr_objective(sabr_vol_fn, finite_diff_fn, butterfly_fn, calendar_fn):
             nu = 0.0
         sig = sabr_vol_fn(k, alpha, beta, rho, nu, F, T)
         w_model = sig * sig * T
-        mse = np.mean((w_target - w_model) ** 2)
+        mse = loss_fn(k, w_model, w_target, mode, weights, w_lo, w_hi, loss_code, f_scale)
         if check_bf or check_cal:
             sig_g = sabr_vol_fn(k_grid, alpha, beta, rho, nu, F, T)
             w_g = sig_g * sig_g * T
@@ -388,25 +546,39 @@ def make_sabr_objective(sabr_vol_fn, finite_diff_fn, butterfly_fn, calendar_fn):
 
 # ── Backend registry ─────────────────────────────────────────────────
 
-jw_w = make_jw_w(svi_w)
+butterfly_penalty = make_butterfly_penalty(density_g)
+jw_w = make_jw_w(svi_w, jw_convert)
+natural_w = make_natural_w(svi_w, natural_convert)
+black_call = make_black_call(ncdf)
+_point_residual = make_point_residual(black_call)
+loss_value = make_loss_value(_point_residual)
+residuals = make_residuals(_point_residual)
 
 _PLAIN = {
     "svi_w": svi_w,
+    "natural_w": natural_w,
+    "natural_convert": natural_convert,
     "ssvi_w": ssvi_w,
     "essvi_w": essvi_w,
     "jw_w": jw_w,
+    "jw_convert": jw_convert,
     "sabr_vol": sabr_vol,
     "directsvi_w": directsvi_w,
     "svi_derivs": svi_derivs,
     "ssvi_derivs": ssvi_derivs,
+    "density_g": density_g,
     "butterfly": butterfly_penalty,
     "calendar": calendar_penalty,
     "finite_diff": finite_diff,
-    "svi_obj": make_svi_objective(svi_w, svi_derivs, butterfly_penalty, calendar_penalty),
-    "ssvi_obj": make_ssvi_objective(ssvi_w, ssvi_derivs, butterfly_penalty, calendar_penalty),
-    "essvi_obj": make_essvi_objective(essvi_w, ssvi_derivs, butterfly_penalty, calendar_penalty),
-    "jw_obj": make_jw_objective(jw_w, svi_derivs, butterfly_penalty, calendar_penalty),
-    "sabr_obj": make_sabr_objective(sabr_vol, finite_diff, butterfly_penalty, calendar_penalty),
+    "black_call": black_call,
+    "loss_value": loss_value,
+    "residuals": residuals,
+    "svi_obj": make_svi_objective(svi_w, svi_derivs, butterfly_penalty, calendar_penalty, loss_value),
+    "natural_obj": make_natural_objective(natural_w, natural_convert, svi_derivs, butterfly_penalty, calendar_penalty, loss_value),
+    "ssvi_obj": make_ssvi_objective(ssvi_w, ssvi_derivs, butterfly_penalty, calendar_penalty, loss_value),
+    "essvi_obj": make_essvi_objective(essvi_w, ssvi_derivs, butterfly_penalty, calendar_penalty, loss_value),
+    "jw_obj": make_jw_objective(jw_w, jw_convert, svi_derivs, butterfly_penalty, calendar_penalty, loss_value),
+    "sabr_obj": make_sabr_objective(sabr_vol, finite_diff, butterfly_penalty, calendar_penalty, loss_value),
 }
 
 _JITTED: dict = {}
@@ -420,28 +592,45 @@ if _NUMBA_AVAILABLE:
     _directsvi_w_nb = _jit(directsvi_w)
     _svi_derivs_nb = _jit(svi_derivs)
     _ssvi_derivs_nb = _jit(ssvi_derivs)
-    _butterfly_nb = _jit(butterfly_penalty)
+    _density_g_nb = _jit(density_g)
+    _jw_convert_nb = _jit(jw_convert)
+    _butterfly_nb = _jit(make_butterfly_penalty(_density_g_nb))
     _calendar_nb = _jit(calendar_penalty)
     _finite_diff_nb = _jit(finite_diff)
-    _jw_w_nb = _jit(make_jw_w(_svi_w_nb))
+    _jw_w_nb = _jit(make_jw_w(_svi_w_nb, _jw_convert_nb))
+    _natural_convert_nb = _jit(natural_convert)
+    _natural_w_nb = _jit(make_natural_w(_svi_w_nb, _natural_convert_nb))
+    _ncdf_nb = _jit(ncdf)
+    _black_call_nb = _jit(make_black_call(_ncdf_nb))
+    _point_residual_nb = _jit(make_point_residual(_black_call_nb))
+    _loss_value_nb = _jit(make_loss_value(_point_residual_nb))
+    _residuals_nb = _jit(make_residuals(_point_residual_nb))
 
     _JITTED = {
         "svi_w": _svi_w_nb,
+        "natural_w": _natural_w_nb,
+        "natural_convert": _natural_convert_nb,
         "ssvi_w": _ssvi_w_nb,
         "essvi_w": _essvi_w_nb,
         "jw_w": _jw_w_nb,
+        "jw_convert": _jw_convert_nb,
         "sabr_vol": _sabr_vol_nb,
         "directsvi_w": _directsvi_w_nb,
         "svi_derivs": _svi_derivs_nb,
         "ssvi_derivs": _ssvi_derivs_nb,
+        "density_g": _density_g_nb,
         "butterfly": _butterfly_nb,
         "calendar": _calendar_nb,
         "finite_diff": _finite_diff_nb,
-        "svi_obj": _jit(make_svi_objective(_svi_w_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb)),
-        "ssvi_obj": _jit(make_ssvi_objective(_ssvi_w_nb, _ssvi_derivs_nb, _butterfly_nb, _calendar_nb)),
-        "essvi_obj": _jit(make_essvi_objective(_essvi_w_nb, _ssvi_derivs_nb, _butterfly_nb, _calendar_nb)),
-        "jw_obj": _jit(make_jw_objective(_jw_w_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb)),
-        "sabr_obj": _jit(make_sabr_objective(_sabr_vol_nb, _finite_diff_nb, _butterfly_nb, _calendar_nb)),
+        "black_call": _black_call_nb,
+        "loss_value": _loss_value_nb,
+        "residuals": _residuals_nb,
+        "svi_obj": _jit(make_svi_objective(_svi_w_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb, _loss_value_nb)),
+        "natural_obj": _jit(make_natural_objective(_natural_w_nb, _natural_convert_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb, _loss_value_nb)),
+        "ssvi_obj": _jit(make_ssvi_objective(_ssvi_w_nb, _ssvi_derivs_nb, _butterfly_nb, _calendar_nb, _loss_value_nb)),
+        "essvi_obj": _jit(make_essvi_objective(_essvi_w_nb, _ssvi_derivs_nb, _butterfly_nb, _calendar_nb, _loss_value_nb)),
+        "jw_obj": _jit(make_jw_objective(_jw_w_nb, _jw_convert_nb, _svi_derivs_nb, _butterfly_nb, _calendar_nb, _loss_value_nb)),
+        "sabr_obj": _jit(make_sabr_objective(_sabr_vol_nb, _finite_diff_nb, _butterfly_nb, _calendar_nb, _loss_value_nb)),
     }
 
 
