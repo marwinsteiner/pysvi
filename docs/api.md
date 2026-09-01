@@ -17,6 +17,14 @@
    :show-inheritance:
 ```
 
+## Surface
+
+```{eval-rst}
+.. automodule:: pysvi.surface
+   :members:
+   :show-inheritance:
+```
+
 ## Diagnostics
 
 ```{eval-rst}
