@@ -69,9 +69,16 @@ def test_fit_skips_failed_slices(surface_df):
 
 # ── Slice access and evaluation ──────────────────────────────────────
 
-def test_unfitted_maturity_raises(svi_surface):
+def test_maturity_range_behaviour(svi_surface):
+    """In-range unquoted maturities interpolate; extrapolation raises."""
+    assert np.isfinite(svi_surface.iv(100.0, 0.7))  # interpolated
+    with pytest.raises(ValueError, match="extrapolation"):
+        svi_surface.iv(100.0, 1.5)
+    with pytest.raises(ValueError, match="extrapolation"):
+        svi_surface.iv(100.0, 0.1)
+    # params() remains exact-slice-only
     with pytest.raises(ValueError, match="not a fitted slice"):
-        svi_surface.iv(100.0, 0.7)
+        svi_surface.params(0.7)
 
 
 def test_forward_and_params(svi_surface):
