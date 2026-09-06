@@ -13,6 +13,8 @@ from .models import (SVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR, ArbitrageFree
                      use_numba, numba_available)
 from .calibration import (prepare_slice, calibrate_slice, apply_slice,
                          calculate_implied_forward, get_model)
+from .diagnostics import (check_slice_arbitrage, check_arbitrage,
+                          SliceArbitrageReport, ArbitrageReport, LEE_BOUND)
 
 __all__ = [
     "SVI", "SSVI", "ESSVI", "JumpWings", "DirectSVI", "SABR", "ArbitrageFreedom", "get_model",
@@ -20,5 +22,7 @@ __all__ = [
     "jw_total_variance", "directsvi_total_variance",
     "sabr_total_variance", "sabr_implied_vol",
     "use_numba", "numba_available",
+    "check_slice_arbitrage", "check_arbitrage",
+    "SliceArbitrageReport", "ArbitrageReport", "LEE_BOUND",
     "prepare_slice", "calibrate_slice", "apply_slice", "calculate_implied_forward"
 ]

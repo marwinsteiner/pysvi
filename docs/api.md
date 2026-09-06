@@ -16,3 +16,11 @@
    :undoc-members:
    :show-inheritance:
 ```
+
+## Diagnostics
+
+```{eval-rst}
+.. automodule:: pysvi.diagnostics
+   :members:
+   :show-inheritance:
+```
