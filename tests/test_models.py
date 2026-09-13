@@ -223,6 +223,116 @@ def test_directsvi_positivity(k):
     assert np.all(w >= -1e-8)
 
 
+# ── Natural SVI tests ────────────────────────────────────────────────
+
+NAT = {"delta": 0.005, "mu": 0.02, "rho": -0.5, "omega": 0.04, "zeta": 1.8}
+
+
+def test_natural_total_variance_formula():
+    """Implementation matches the Gatheral-Jacquier natural SVI formula."""
+    from src.pysvi.models import natural_total_variance
+    k = np.linspace(-0.4, 0.4, 41)
+    z = k - NAT["mu"]
+    expected = NAT["delta"] + 0.5 * NAT["omega"] * (
+        1.0
+        + NAT["zeta"] * NAT["rho"] * z
+        + np.sqrt((NAT["zeta"] * z + NAT["rho"]) ** 2 + 1.0 - NAT["rho"] ** 2)
+    )
+    result = natural_total_variance(k, **NAT)
+    np.testing.assert_allclose(result, expected, rtol=1e-12)
+
+
+def test_natural_raw_bijection_roundtrip():
+    """natural -> raw -> natural recovers parameters to 1e-10."""
+    from src.pysvi.models import natural_to_raw, raw_to_natural
+    raw = natural_to_raw(**NAT)
+    back = raw_to_natural(**raw)
+    for name, value in NAT.items():
+        np.testing.assert_allclose(back[name], value, rtol=1e-10)
+    # and the other direction
+    raw_start = {"a": 0.01, "b": 0.12, "rho": -0.6, "m": 0.01, "sigma": 0.25}
+    nat = raw_to_natural(**raw_start)
+    raw_back = natural_to_raw(**nat)
+    for name, value in raw_start.items():
+        np.testing.assert_allclose(raw_back[name], value, rtol=1e-10)
+
+
+def test_natural_evaluates_as_raw_equivalent():
+    """natural_total_variance == svi_total_variance on the mapped params."""
+    from src.pysvi.models import natural_total_variance, natural_to_raw
+    k = np.linspace(-1.0, 1.0, 101)
+    raw = natural_to_raw(**NAT)
+    np.testing.assert_allclose(
+        natural_total_variance(k, **NAT),
+        svi_total_variance(k, **raw),
+        rtol=1e-12,
+    )
+
+
+@given(k=st.lists(st.floats(-1.0, 1.0), min_size=1, max_size=100))
+def test_natural_positivity(k):
+    """Natural SVI total variance non-negative for delta >= 0."""
+    from src.pysvi.models import natural_total_variance
+    k = np.array(k)
+    w = natural_total_variance(k, delta=0.005, mu=0.0, rho=-0.5, omega=0.04, zeta=2.0)
+    assert np.all(w >= -1e-8)
+    assert np.all(np.isfinite(w))
+
+
+def test_natural_factory():
+    """get_model('natural') and get_model('nsvi') return NaturalSVI."""
+    from src.pysvi.models import NaturalSVI
+    assert isinstance(get_model("natural"), NaturalSVI)
+    assert isinstance(get_model("NSVI"), NaturalSVI)
+    m = get_model("natural", ArbitrageFreedom.NO_BUTTERFLY)
+    assert ArbitrageFreedom.NO_BUTTERFLY in m.arbitrage_condition
+
+
+def test_natural_self_recovery():
+    """Calibration reproduces a clean natural SVI smile to tiny RMSE."""
+    from src.pysvi.models import NaturalSVI, natural_total_variance
+    k = np.linspace(-0.4, 0.4, 41)
+    w = natural_total_variance(k, **NAT)
+    model = NaturalSVI()
+    params = model.calibrate(k, w)
+    assert params is not None
+    w_fit = model.total_variance(k, params)
+    rmse = float(np.sqrt(np.mean((w - w_fit) ** 2)))
+    assert rmse < 1e-5, f"natural SVI self-recovery RMSE too high: {rmse}"
+
+
+def test_natural_roundtrip(natural_calibrated):
+    """End-to-end NaturalSVI: calibrate -> apply -> IV RMSE < 50bps."""
+    from src.pysvi.calibration import apply_slice
+    model, df_slice, params = natural_calibrated
+    fitted = apply_slice(df_slice, params, model)
+    rmse = float(np.sqrt(np.mean(fitted["residual_iv"] ** 2)))
+    assert rmse < 0.005, f"NaturalSVI roundtrip RMSE too high: {rmse}"
+
+
+def test_natural_no_butterfly_calibration(atm_slice):
+    """NaturalSVI with NO_BUTTERFLY yields non-negative density."""
+    from src.pysvi.calibration import prepare_slice, calibrate_slice
+    from src.pysvi.models import NaturalSVI
+    model = NaturalSVI(arbitrage_condition=ArbitrageFreedom.NO_BUTTERFLY)
+    params = calibrate_slice(atm_slice, model)
+    assert params is not None
+    k, _, _ = prepare_slice(atm_slice)
+    k_check = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 500)
+    g = model.density(k_check, params)
+    assert np.all(g >= -1e-6), f"Butterfly violation: min g = {g.min():.6f}"
+
+
+def test_natural_wing_slopes_match_raw():
+    """Wing slopes agree with the raw-SVI equivalents b(1 -/+ rho)."""
+    from src.pysvi.models import NaturalSVI, natural_to_raw
+    model = NaturalSVI()
+    raw = natural_to_raw(**NAT)
+    slopes = model.wing_slopes(NAT)
+    np.testing.assert_allclose(slopes[0], raw["b"] * (1 - raw["rho"]), rtol=1e-12)
+    np.testing.assert_allclose(slopes[1], raw["b"] * (1 + raw["rho"]), rtol=1e-12)
+
+
 # ── SABR tests ───────────────────────────────────────────────────────
 
 def test_sabr_atm_formula():

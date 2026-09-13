@@ -131,6 +131,96 @@ def jw_total_variance(
     return _kernels.resolve("jw_w")(_as_f64(k), v_t, psi_t, p_t, c_t, v_tilde_t, T)
 
 
+def natural_total_variance(
+    k: np.ndarray, delta: float, mu: float, rho: float, omega: float, zeta: float
+) -> np.ndarray:
+    """Natural SVI total variance w(k) [Gatheral & Jacquier 2014].
+
+    ::
+
+        w(k) = Δ + ω/2 {1 + ζρ(k − μ) + sqrt[(ζ(k − μ) + ρ)² + (1 − ρ²)]}
+
+    Bijective with raw SVI (see :func:`natural_to_raw` /
+    :func:`raw_to_natural`); the natural parameters map more directly to
+    ATM level, skew, and curvature.
+
+    Parameters
+    ----------
+    k : array
+        Log-moneyness log(K/F).
+    delta : float
+        Vertical variance shift (minimum-variance level).
+    mu : float
+        Log-moneyness translation of the smile.
+    rho : float
+        Skew (correlation), abs(rho) < 1.
+    omega : float
+        Overall variance scale, omega >= 0.
+    zeta : float
+        Curvature / smile-width scale, zeta > 0.
+
+    Returns
+    -------
+    array
+        Total variance w(k) = sigma^2(k) * T.
+    """
+    return _kernels.resolve("natural_w")(_as_f64(k), delta, mu, rho, omega, zeta)
+
+
+def natural_to_raw(
+    delta: float, mu: float, rho: float, omega: float, zeta: float
+) -> Dict[str, float]:
+    """Natural SVI parameters -> raw SVI parameters.
+
+    ::
+
+        a = Δ + ω(1 − ρ²)/2,   b = ωζ/2,   ρ = ρ,
+        m = μ − ρ/ζ,           σ = sqrt(1 − ρ²)/ζ
+
+    Requires zeta > 0 and abs(rho) < 1.
+
+    Returns
+    -------
+    dict
+        {'a', 'b', 'rho', 'm', 'sigma'}.
+    """
+    a, b, rho_r, m, sigma = _kernels.resolve("natural_convert")(
+        delta, mu, rho, omega, zeta
+    )
+    return {
+        "a": float(a), "b": float(b), "rho": float(rho_r),
+        "m": float(m), "sigma": float(sigma),
+    }
+
+
+def raw_to_natural(
+    a: float, b: float, rho: float, m: float, sigma: float
+) -> Dict[str, float]:
+    """Raw SVI parameters -> natural SVI parameters (inverse bijection).
+
+    ::
+
+        ζ = sqrt(1 − ρ²)/σ,   ω = 2bσ/sqrt(1 − ρ²),   ρ = ρ,
+        μ = m + ρσ/sqrt(1 − ρ²),   Δ = a − bσ sqrt(1 − ρ²)
+
+    Requires sigma > 0 and abs(rho) < 1.
+
+    Returns
+    -------
+    dict
+        {'delta', 'mu', 'rho', 'omega', 'zeta'}.
+    """
+    root = np.sqrt(1.0 - rho * rho)
+    zeta = root / sigma
+    omega = 2.0 * b * sigma / root
+    mu = m + rho * sigma / root
+    delta = a - b * sigma * root
+    return {
+        "delta": float(delta), "mu": float(mu), "rho": float(rho),
+        "omega": float(omega), "zeta": float(zeta),
+    }
+
+
 def sabr_implied_vol(
     k: np.ndarray, alpha: float, beta: float, rho: float, nu: float,
     F: float, T: float,
@@ -551,6 +641,142 @@ class SVI(Parametrization):
     ) -> Optional[tuple[float, float]]:
         """Asymptotic wing slopes: left b(1 - ρ), right b(1 + ρ)."""
         b, rho = params["b"], params["rho"]
+        return b * (1.0 - rho), b * (1.0 + rho)
+
+
+class NaturalSVI(Parametrization):
+    """Natural SVI parametrization [Gatheral & Jacquier 2014].
+
+    ::
+
+        w(k) = Δ + ω/2 {1 + ζρ(k − μ) + sqrt[(ζ(k − μ) + ρ)² + (1 − ρ²)]}
+
+        Δ : vertical variance shift        (unconstrained)
+        μ : log-moneyness translation      (unconstrained)
+        ρ : skew (correlation)             abs(ρ) < 1
+        ω : overall variance scale         ω > 0
+        ζ : curvature / smile-width scale  ζ > 0
+
+    Same 5 degrees of freedom as raw SVI, connected by an explicit
+    bijection (:func:`natural_to_raw` / :func:`raw_to_natural`), but the
+    parameters map more directly to ATM level, skew, and curvature —
+    often better behaved in calibration and useful as an initialisation
+    coordinate system for raw SVI.
+
+    Calibrates via L-BFGS-B (bounded) → Nelder-Mead fallback; evaluation
+    and derivatives go through the raw-SVI equivalents.
+
+    Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/natural.html
+    """
+
+    def calibrate(
+        self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
+    ) -> Optional[Dict[str, float]]:
+        """Minimize MSE(w_model(k), w_target) subject to constraints.
+
+        Parameters
+        ----------
+        k : NDArray[np.float64]
+            Log-moneyness array.
+        w_target : NDArray[np.float64]
+            Market total variances σ_mkt²T.
+        **kwargs
+            Optional 'w_prev': prior slice total variance for calendar arb.
+
+        Returns
+        -------
+        Dict[str, float] or None
+            {'delta', 'mu', 'rho', 'omega', 'zeta'} or None (opt failed).
+        """
+        from scipy.optimize import minimize
+
+        k, w_target, k_grid, w_prev_arr, has_prev, check_butterfly, check_calendar = (
+            _prepare_objective_inputs(k, w_target, self.arbitrage_condition, kwargs)
+        )
+        core = _kernels.resolve("natural_obj")
+
+        def objective(params):
+            return core(
+                np.asarray(params, dtype=np.float64), k, w_target,
+                k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
+            )
+
+        # Initial guess: the raw-SVI heuristics mapped through the bijection
+        # at rho = 0 (zeta = 1/sigma, omega = 2 b sigma, mu = m, delta = a - b sigma)
+        a0 = float(np.nanmin(w_target))
+        spread = float(np.nanmax(w_target) - a0)
+        k_abs_max = float(np.max(np.abs(k)))
+        b0 = max(spread / max(k_abs_max, 1.0), 1e-4)
+        sigma0 = max(float(np.std(k)), 0.1)
+        x0 = np.array([
+            a0 - b0 * sigma0,             # delta
+            float(np.median(k)),          # mu
+            0.0,                          # rho
+            max(2.0 * b0 * sigma0, 1e-4), # omega
+            1.0 / sigma0,                 # zeta
+        ])
+
+        bounds = [
+            (None, None),      # delta
+            (None, None),      # mu
+            (-0.999, 0.999),   # abs(rho) < 1
+            (1e-8, None),      # omega > 0
+            (1e-8, None),      # zeta > 0
+        ]
+
+        # Tight ftol/gtol as for SABR: total-variance MSEs are O(1e-8) even
+        # mid-fit, so scipy's default relative ftol stops too early.
+        res = minimize(
+            objective, x0, method="L-BFGS-B", bounds=bounds,
+            options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+        )
+        if not res.success:
+            res = minimize(
+                objective, x0, method="Nelder-Mead",
+                options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+            )
+            if not res.success:
+                return None
+
+        delta, mu, rho, omega, zeta = res.x
+        if omega <= 0 or zeta <= 0 or abs(rho) >= 0.999:
+            return None
+
+        return {
+            "delta": float(delta),
+            "mu": float(mu),
+            "rho": float(rho),
+            "omega": float(omega),
+            "zeta": float(zeta),
+        }
+
+    def total_variance(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Evaluate natural SVI w(k) via the raw-SVI equivalents."""
+        return natural_total_variance(
+            k, params["delta"], params["mu"], params["rho"],
+            params["omega"], params["zeta"],
+        )
+
+    @staticmethod
+    def _raw_svi(params: Dict[str, float]) -> tuple[float, float, float, float, float]:
+        return _kernels.resolve("natural_convert")(
+            params["delta"], params["mu"], params["rho"],
+            params["omega"], params["zeta"],
+        )
+
+    def derivatives(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Analytic (w, w', w'') via the raw-SVI equivalent parameters."""
+        return _svi_derivatives(_as_f64(k), *self._raw_svi(params))
+
+    def wing_slopes(
+        self, params: Dict[str, float]
+    ) -> Optional[tuple[float, float]]:
+        """Asymptotic wing slopes via the raw-SVI equivalents: b(1 ∓ ρ)."""
+        _, b, rho, _, _ = self._raw_svi(params)
         return b * (1.0 - rho), b * (1.0 + rho)
 
 
