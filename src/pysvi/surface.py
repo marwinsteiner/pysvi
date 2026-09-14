@@ -633,11 +633,15 @@ def calibrate_surface(
         raise ValueError("calibrate_surface: empty input panel")
 
     prepared = []
+    slice_reports = []
     for T, g in groups:
         k_i, w_i, F_i = prepare_slice(g)
         if k_i is None:
             logger.warning(
                 f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
+            )
+            slice_reports.append(
+                build_slice_report(T, SLICE_INSUFFICIENT, len(g))
             )
             continue
         prepared.append((T, g, k_i, w_i, F_i))
@@ -685,7 +689,24 @@ def calibrate_surface(
     if isinstance(instance, (SSVI, ESSVI)):
         _warn_ssvi_admissibility(slices)
 
-    return VolSurface(instance, slices, r=r, interp_method=interp_method)
+    params_by_T = dict(slices)
+    for T, g, k_i, w_i, F_i in prepared:
+        if T in params_by_T:
+            w_fit = instance.total_variance(k_i, params_by_T[T])
+            slice_reports.append(build_slice_report(
+                T, SLICE_OK, len(g), k=k_i,
+                iv_mkt=np.sqrt(np.maximum(w_i, 0.0) / T),
+                iv_fit=np.sqrt(np.maximum(w_fit, 0.0) / T),
+            ))
+        else:
+            slice_reports.append(build_slice_report(T, SLICE_FAILED, len(g), k=k_i))
+    slice_reports.sort(key=lambda item: item.maturity)
+    report = build_surface_report(
+        slice_reports, type(instance).__name__, model_kwargs,
+        calendar_enforced=enforce_calendar,
+    )
+    return VolSurface(instance, slices, r=r, interp_method=interp_method,
+                      fit_report=report)
 
 
 def _calibrate_essvi_global(

@@ -194,3 +194,22 @@ def test_single_slice_surface_cannot_interpolate(surface_df):
     assert np.isfinite(single.iv(100.0, 0.5))
     with pytest.raises(ValueError, match="extrapolation"):
         single.iv(100.0, 0.7)
+
+
+def test_calibrate_surface_populates_fit_report(surface_df):
+    surface = calibrate_surface(surface_df, model="ssvi", r=R)
+    report = surface.fit_report
+    assert report is not None and report.ok
+    assert report.calendar_enforced
+    assert report.model == "SSVI"
+    assert report.n_ok == 3
+    diag = surface.diagnose()
+    assert diag.ok, str(diag)
+    assert "Calendar:  enforced" in str(diag)
+
+
+def test_calibrate_surface_report_essvi_global(surface_df):
+    surface = calibrate_surface(surface_df, model="essvi", r=R)
+    report = surface.fit_report
+    assert report.n_ok == 3
+    assert all(s.iv_rmse is not None for s in report.slices)
