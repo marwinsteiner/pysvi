@@ -25,6 +25,14 @@
    :show-inheritance:
 ```
 
+## Reports
+
+```{eval-rst}
+.. automodule:: pysvi.report
+   :members:
+   :show-inheritance:
+```
+
 ## Diagnostics
 
 ```{eval-rst}

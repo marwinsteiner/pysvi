@@ -41,6 +41,11 @@ from .models import (
 )
 from .calibration import calibrate_slice, get_model, prepare_slice
 from .diagnostics import ArbitrageReport, check_arbitrage
+from .report import (
+    SLICE_FAILED, SLICE_INSUFFICIENT, SLICE_OK,
+    SurfaceDiagnostics, SurfaceFitReport,
+    build_slice_report, build_surface_report,
+)
 
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
 _INTERP_METHODS = ("total_variance", "theta")
@@ -120,6 +125,10 @@ class VolSurface:
         calendar-free whenever the bracketing slices are). "theta"
         (SSVI/eSSVI only) interpolates the ATM total variance and shape
         parameters, yielding a genuine parametric slice at any maturity.
+    fit_report : SurfaceFitReport, optional
+        Calibration provenance and per-slice evidence; populated by
+        :meth:`fit` and :func:`calibrate_surface`, None on direct
+        construction.
     """
 
     def __init__(
@@ -131,6 +140,7 @@ class VolSurface:
         ],
         r: float = 0.0,
         interp_method: str = "total_variance",
+        fit_report: "SurfaceFitReport" = None,
     ) -> None:
         if isinstance(slices, Mapping):
             slices = slices.items()
@@ -160,6 +170,7 @@ class VolSurface:
         self.model = model
         self.r = float(r)
         self.interp_method = interp_method
+        self.fit_report = fit_report
         self._slices = ordered
 
     # ── Construction ─────────────────────────────────────────────────
@@ -222,20 +233,46 @@ class VolSurface:
 
         theta_by_T, theta_ref = _data_thetas(instance, groups)
         slices = []
+        slice_reports = []
         for T, g in groups:
             kwargs = _auto_slice_kwargs(
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
-            params = calibrate_slice(g, instance, **kwargs)
+            n_quotes = len(g)
+            k, w, F = prepare_slice(g)
+            if k is None:
+                logger.warning(
+                    f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
+                )
+                slice_reports.append(
+                    build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
+                )
+                continue
+            params = instance.calibrate(k, w, **kwargs)
             if params is None:
                 logger.warning(
                     f"VolSurface.fit: slice T={T:g} failed to calibrate; skipping"
                 )
+                slice_reports.append(
+                    build_slice_report(T, SLICE_FAILED, n_quotes, k=k)
+                )
                 continue
+            params["forward"] = F
+            w_fit = instance.total_variance(k, params)
+            slice_reports.append(build_slice_report(
+                T, SLICE_OK, n_quotes, k=k,
+                iv_mkt=np.sqrt(np.maximum(w, 0.0) / T),
+                iv_fit=np.sqrt(np.maximum(w_fit, 0.0) / T),
+            ))
             slices.append((T, params))
         if not slices:
             raise ValueError("VolSurface.fit: no slice calibrated successfully")
-        return cls(instance, slices, r=r, interp_method=interp_method)
+        report = build_surface_report(
+            slice_reports, type(instance).__name__, model_kwargs,
+            calendar_enforced=False,
+        )
+        return cls(instance, slices, r=r, interp_method=interp_method,
+                   fit_report=report)
 
     # ── Slice access and maturity location ───────────────────────────
 
@@ -392,6 +429,31 @@ class VolSurface:
         ``k_max``, ``n_grid``, ``tol``, ``k_data``) pass through.
         """
         return check_arbitrage(self.model, self._slices, **kwargs)
+
+    def diagnose(self, **kwargs) -> SurfaceDiagnostics:
+        """Fit report and arbitrage diagnostics in one result block.
+
+        Combines :attr:`fit_report` (calibration status, quote
+        accounting, residuals, settings, provenance) with
+        :meth:`check_arbitrage`. When no explicit grid is given and a
+        fit report is available, the arbitrage checks run on the quoted
+        log-moneyness range (the surface's domain of validity) rather
+        than the wide default grid. ``print(surface.diagnose())`` renders
+        the formatted block; all fields are individually accessible.
+        """
+        if (
+            self.fit_report is not None
+            and "k_data" not in kwargs
+            and "k_min" not in kwargs
+            and "k_max" not in kwargs
+        ):
+            quoted = self.fit_report.quoted_range()
+            if quoted is not None:
+                kwargs["k_data"] = np.array(quoted)
+        return SurfaceDiagnostics(
+            fit=self.fit_report,
+            arbitrage=self.check_arbitrage(**kwargs),
+        )
 
     # ── Black-76 pricing and Greeks ──────────────────────────────────
 

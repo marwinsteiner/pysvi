@@ -65,6 +65,19 @@ surface.params(T)             # per-slice parameter dict
 
 All strike/moneyness inputs are vectorized; scalar in, scalar out. Any maturity inside the fitted range works (see Interpolation below); maturities outside it raise.
 
+## Fit reports and diagnostics
+
+A surface is the output of a calibration process, and the process carries the evidence needed to trust the output. `fit` records that evidence on the surface:
+
+```python
+surface.fit_report        # per-slice status, quote accounting, residuals, settings, provenance
+print(surface.diagnose()) # fit report + arbitrage diagnostics in one formatted block
+```
+
+`fit_report` lists every slice of the input panel — including slices that failed to calibrate or were rejected for insufficient data — with quote counts (in vs used), implied-vol RMSE and max residual, and the quoted log-moneyness range. The report also records the calibration settings (objective, loss, initialization, backend) and provenance (svi-py version, fit timestamp). `report.ok` is False whenever any slice of the panel did not make it into the surface, so partial fits cannot pass silently.
+
+`diagnose()` combines the fit report with `check_arbitrage`, run by default on the quoted strike range (the surface's domain of validity) rather than the wide default grid, and renders a single scikit-learn-style result block; every field remains individually accessible on the returned object. Surfaces constructed directly from parameter dicts have `fit_report=None` and `diagnose()` reports arbitrage only.
+
 ## Verifying
 
 ```python
