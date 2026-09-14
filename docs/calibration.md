@@ -31,7 +31,7 @@ params = calibrate_slice(
 
 - `initialization="default"` — the per-model heuristics (unchanged behaviour).
 - `"jump_wings"` (SVI and NaturalSVI) — a data-driven start read off the quotes: wing slopes from the outer 20% of strikes on each side, skew from their asymmetry, vertex from the minimum-variance strike.
-- `"multi_start"` — a deterministic grid of starts (the default start plus skew and width variations, 16 total); each runs L-BFGS-B to tight tolerance and the best converged result wins. Raw SVI's landscape has genuine bad basins that a single start can fall into — multi-start is the recommended setting whenever fit quality matters more than the last millisecond, and it is cheap under the numba backend.
+- `"multi_start"` — a deterministic grid of starts (the default start plus skew and width variations, 16 total); each runs L-BFGS-B to tight tolerance and the result with the lowest objective value wins. The default start is additionally run under the default path's own settings, so `multi_start` can never return a worse fit than `default` with the same controls. Raw SVI's landscape has genuine bad basins that a single start can fall into — multi-start is the recommended setting whenever fit quality matters more than the last millisecond, and it is cheap under the numba backend.
 
 When any control is active the optimizer runs with tight tolerances (`ftol=1e-15`); the plain default path keeps scipy's defaults for backward-compatible fits.
 
