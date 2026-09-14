@@ -83,17 +83,17 @@ def main() -> None:
     # ── Calibrate all seven models to the same real slice ────────────
     # get_model takes the lowercase name and an ArbitrageFreedom flag;
     # per-model extras go through calibrate_slice as keyword arguments.
-    # Initialization matters on real data and is worth MEASURING per
-    # model: here multi_start beats the default start by 3-5x for
-    # svi/ssvi/essvi/sabr, while jw does better from its data-driven
-    # default on this snapshot. dsvi is closed-form (no controls).
+    # multi_start throughout: on real data it beats the default start
+    # by 3-5x for several models here, and it is guaranteed never to be
+    # worse (the default start also runs under the default path's own
+    # settings and competes). dsvi is closed-form (no controls).
     runs = [
         ("svi", {"initialization": "multi_start"}),
         ("natural", {"initialization": "multi_start"}),
         ("ssvi", {"theta": theta, "initialization": "multi_start"}),
         ("essvi", {"theta": theta, "theta_ref": theta,
                    "initialization": "multi_start"}),
-        ("jw", {"T": T}),
+        ("jw", {"T": T, "initialization": "multi_start"}),
         ("dsvi", {}),
         ("sabr", {"T": T, "F": F, "beta": 0.5,
                   "initialization": "multi_start"}),
