@@ -41,6 +41,7 @@ Between fitted maturities the surface interpolates; beyond the fitted range it r
 
 - `"total_variance"` (default, any model) — linear interpolation of $w(k)$ in $T$ at fixed log-moneyness. Model-agnostic, exact at fitted maturities, and calendar-free between two slices whenever they are ordered ($w$ of the blend lies between them at every $k$).
 - `"theta"` (SSVI/eSSVI) — interpolates the ATM total variance $\theta(T)$ and shape parameters, yielding a genuine parametric slice at any maturity; `surface.slice_at(T)` returns its params dict. Under a joint eSSVI fit the shape parameters are shared, so only $\theta$ actually interpolates.
+- `"monotone_cubic"` (any model, at least two slices) — a shape-preserving cubic (PCHIP, Fritsch–Carlson) in $T$ at fixed log-moneyness across **all** fitted slices. Exact at fitted maturities, monotone in $T$ wherever the fitted slices are (calendar-free slices stay calendar-free between expiries), and continuously differentiable in maturity — see Differentiability below.
 
 Forwards interpolate log-linearly in $T$ (piecewise-constant forward rate). All evaluation and pricing methods (`iv`, `total_variance`, `price`, Greeks, `atm_vol`, `skew`, `curvature`) accept any maturity in range; `params(T)` remains exact-slice-only, and `slice_at(T)` between slices requires the `"theta"` method.
 
@@ -49,6 +50,20 @@ surface = calibrate_surface(df, model="ssvi")
 surface.iv(100.0, 1.37)        # interpolated maturity
 surface.price(95.0, 1.37, "put")
 ```
+
+### Differentiability and Dupire-readiness
+
+`surface.regularity` declares the smoothness guarantee in maturity: `"C0"` for the linear blend and the theta method (continuous, but $\partial w/\partial T$ jumps at every fitted slice), `"C1"` for `"monotone_cubic"`. A C0 surface is **pricing-ready** — implied vols, prices, and sticky-strike Greeks are all well defined — but **not Dupire-ready**: local volatility, forward variance, and PDE coefficients consume $\partial w/\partial T$, which would be discontinuous exactly at the traded expiries.
+
+With `interp_method="monotone_cubic"` the maturity derivative exists and is continuous everywhere in the fitted range, exposed directly:
+
+```python
+surface = VolSurface.fit(df, model="svi", interp_method="monotone_cubic")
+surface.regularity        # "C1"
+surface.dw_dT(k, T)       # the Dupire numerator, any T in range
+```
+
+`dw_dT` on a C0 surface raises rather than return a one-sided number that would be silently wrong at the knots. Smoothness in strike comes from the model itself and is analytic for the SVI family under every method.
 
 ## Evaluation
 

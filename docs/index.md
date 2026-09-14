@@ -33,6 +33,7 @@ surface
 models/index
 arbitrage
 calibration
+identifiability
 api
 contributing
 ```

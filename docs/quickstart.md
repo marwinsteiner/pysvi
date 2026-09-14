@@ -86,6 +86,16 @@ overhead, so gains there are modest. Kernels compile on first use in each
 process (a few seconds); measure your own workload with
 `python scripts/bench_numba.py`.
 
+For production services: `pysvi.warm_up()` compiles every kernel up front
+(indicatively ~15 s for the full set, versus ~2-3 s ambushing the first
+live request per model; near-zero when already warm), and
+`with pysvi.backend("numpy"/"numba"):` pins the backend per context
+(thread/async-task local) instead of mutating the process-global flag --
+safe for mixed concurrent workloads where `use_numba` is not. Disk
+caching of compiled kernels stays deliberately off: numba's cache keys
+on the importing module name, and the same source imported under two
+names poisons the cache with ModuleNotFoundError.
+
 ## Where do the inputs come from?
 
 `svi-py` expects you to already have implied volatilities and forward prices. If you're starting from raw option prices, the library provides helpers:

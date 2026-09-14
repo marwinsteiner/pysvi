@@ -35,6 +35,18 @@ params = calibrate_slice(
 
 When any control is active the optimizer runs with tight tolerances (`ftol=1e-15`); the plain default path keeps scipy's defaults for backward-compatible fits.
 
+## Failure semantics: strict / warn / lenient
+
+The ingestion and fit entry points (`OptionChain.from_dataframe`, `chain.fit`, `VolSurface.fit`, `calibrate_surface`) take `mode`:
+
+- `"strict"` — the first bad input raises with its location: an invalid quote row (with its input row index), an expiry that cannot form a forward, a mid quote whose implied vol will not invert, a slice too thin to calibrate or that fails to converge (with its maturity).
+- `"warn"` (default) — problems are logged and recorded; the previous behaviour.
+- `"lenient"` — problems are filtered silently, but still recorded.
+
+**Nothing disappears without a count**: rejected quotes, failed inversions, and skipped expiries land on `chain.rejections` and flow onto the surface's fit report (`n_rejected_quotes`, `n_failed_inversions`, `n_skipped_expiries`, plus the per-slice quote accounting that was already there), in every mode. Schema errors — an unrecognized `cp` value, an unknown `mode` — raise in every mode: they are caller bugs, not bad data.
+
+The library installs no blanket warning suppression, and implied-vol inversion catches only the specific py_vollib failure exceptions (below intrinsic, above maximum, and numerical-domain errors); anything else propagates.
+
 ## Per-slice pipeline
 
 The pipeline for a single maturity slice is:

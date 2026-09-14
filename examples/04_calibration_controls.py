@@ -132,6 +132,25 @@ def main() -> None:
             print(f"use_numba({enabled!s:<5}) multi_start fit: {ms:6.1f} ms")
         use_numba(True)
 
+    # Production services: use_numba mutates process-global state, which
+    # races under concurrency. backend() pins the choice per context
+    # (thread/async-task local), and warm_up() moves the one-off JIT
+    # compilation cost (~15 s for every kernel of every model) to
+    # service startup instead of the first live request.
+    from pysvi import backend, warm_up
+    secs = warm_up()
+    print(f"warm_up(): all kernels compiled in {secs:.1f} s "
+          "(near-zero when already warm)")
+    with backend("numpy"):
+        t0 = time.perf_counter()
+        model.calibrate(k, w, initialization="multi_start")
+        print(f"backend('numpy') fit:  {(time.perf_counter() - t0) * 1e3:6.1f} ms")
+    if numba_available():
+        with backend("numba"):
+            t0 = time.perf_counter()
+            model.calibrate(k, w, initialization="multi_start")
+            print(f"backend('numba') fit:  {(time.perf_counter() - t0) * 1e3:6.1f} ms")
+
 
 if __name__ == "__main__":
     main()

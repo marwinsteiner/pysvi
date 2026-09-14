@@ -51,6 +51,22 @@ def main() -> None:
           f"{[round(T, 3) for T in chain.maturities]}")
     print(f"panel columns: {list(panel.columns)}")
 
+    # ── Failure semantics: strict / warn / lenient ───────────────────
+    # Nothing disappears silently: every mode records rejected quotes,
+    # failed inversions, and skipped expiries on chain.rejections, and
+    # fit() carries the counts onto the surface's fit report. strict
+    # raises on the first bad input with its location; lenient filters
+    # without logging. Demonstrate strict on a deliberately bad quote:
+    print(f"ingestion accounting: {chain.rejections}")
+    corrupted = df.copy()
+    corrupted.loc[corrupted.index[0], ["bid", "ask"]] = [5.0, 4.0]  # crossed
+    try:
+        OptionChain.from_dataframe(corrupted, strike="strike", expiry="expiry",
+                                   cp="cp", bid="bid", ask="ask",
+                                   rate=r_flat, mode="strict")
+    except ValueError as err:
+        print(f"mode='strict' raised as designed: {str(err)[:70]}...")
+
     # ── Route 1: chain.fit -- independent slices ─────────────────────
     surface = chain.fit(
         model="svi",
@@ -128,6 +144,22 @@ def main() -> None:
     assert np.array_equal(loaded.iv(K, T_mid), surface.iv(K, T_mid))
     print(f"\nsaved -> {path.name}; load() round-trips evaluation exactly "
           f"(pysvi {loaded.fit_report.pysvi_version})")
+
+    # ── Differentiability: C1 maturity interpolation ─────────────────
+    # The default total-variance blend is continuous but its maturity
+    # derivative jumps at every fitted slice (regularity "C0"): fine
+    # for prices and IVs, wrong for anything consuming dw/dT (Dupire
+    # local vol, forward variance). interp_method="monotone_cubic" is
+    # a shape-preserving cubic in T -- C1, exact at fitted maturities,
+    # calendar-monotone -- and unlocks the dw_dT accessor.
+    c1 = VolSurface.fit(
+        panel, model="svi", r=r_flat,
+        interp_method="monotone_cubic", initialization="multi_start",
+    )
+    print(f"\nregularity: default={surface.regularity}, "
+          f"monotone_cubic={c1.regularity}")
+    print(f"dw_dT(ATM, T={T_mid:.3f}) = {c1.dw_dT(0.0, T_mid):.5f} "
+          "(the Dupire numerator)")
 
     # ── Direct construction ──────────────────────────────────────────
     # VolSurface is just (model, {maturity: params}) -- params from any
