@@ -54,7 +54,7 @@ If you're starting from raw option prices rather than implied vols:
 
 ### Implied volatilities
 
-`compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib`. Failures (e.g. below-intrinsic prices) come back as `NaN`.
+`compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib`. Failures (e.g. below-intrinsic prices) come back as `NaN`. Under the hood `py_vollib` inverts with Jäckel's ["Let's Be Rational"](https://github.com/vollib/lets_be_rational) algorithm (full machine precision in ~two price evaluations); see {doc}`examples` for a survey of inversion methods, including Schadner's explicit [Volfi](https://github.com/wol-fi/volfi) inverse.
 
 ### Implied forwards
 

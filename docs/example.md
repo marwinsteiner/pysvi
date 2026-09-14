@@ -2,6 +2,8 @@
 
 One complete, runnable walkthrough: raw call/put quotes with bid/ask spreads, through ingestion and calendar-aware calibration, to a verified surface you can evaluate, price, audit, and persist.
 
+This page uses a synthetic chain so every number is reproducible in the docs. For the same pipeline on **real market data** — a live SPY chain fetched via yfinance, with the no-lookahead snapshot discipline spelled out — see {doc}`examples`.
+
 ## 1. A realistic synthetic chain
 
 Both legs quoted at every strike, three expiries, bid/ask spreads. Replace this block with your own market data.

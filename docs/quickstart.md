@@ -90,11 +90,11 @@ process (a few seconds); measure your own workload with
 
 `svi-py` expects you to already have implied volatilities and forward prices. If you're starting from raw option prices, the library provides helpers:
 
-- `compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib`.
+- `compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib` (whose inversion engine is Jäckel's ["Let's Be Rational"](https://github.com/vollib/lets_be_rational) — see {doc}`examples` for the method landscape).
 - `calculate_implied_forward` estimates the forward price from put-call parity:
 
 $$F = K + e^{rT}(C - P)$$
 
 - `choose_leg` selects the OTM leg (calls for $K \geq F$, puts for $K < F$) for cleaner vol quotes.
 
-You need a panel of **contemporaneous call and put option prices** across multiple strikes for at least one maturity. The richer the strike grid, the better the calibration. See {doc}`calibration` for pipeline details.
+You need a panel of **contemporaneous call and put option prices** across multiple strikes for at least one maturity. The richer the strike grid, the better the calibration. See {doc}`calibration` for pipeline details, and {doc}`examples` for runnable scripts that build such a panel from real Yahoo Finance data without lookahead.
