@@ -213,3 +213,77 @@ def test_pricing_shapes_and_validation(svi_surface):
         svi_surface.price(100.0, T, cp="straddle")
     with pytest.raises(ValueError, match="positive"):
         svi_surface.price(-5.0, T)
+
+
+# ── Fit report and diagnose() ────────────────────────────────────────
+
+def test_fit_report_populated(svi_surface, surface_df):
+    report = svi_surface.fit_report
+    assert report is not None and report.ok
+    assert report.model == "SVI"
+    assert report.n_ok == 3 and report.n_failed == 0
+    assert report.n_quotes == len(surface_df) and report.n_used == len(surface_df)
+    for s in report.slices:
+        assert s.status == "ok"
+        assert s.iv_rmse is not None and s.iv_rmse < 0.005
+        assert s.max_abs_iv_residual >= s.iv_rmse
+        assert s.k_min == pytest.approx(-0.25, abs=1e-9)
+        assert s.k_max == pytest.approx(0.25, abs=1e-9)
+    assert report.quoted_range() == pytest.approx((-0.25, 0.25))
+    text = report.summary()
+    assert "SurfaceFitReport" in text and "iv RMSE" in text
+
+
+def test_fit_report_records_failures(surface_df):
+    import pandas as pd
+    junk = pd.DataFrame({
+        "strike": [90.0, 100.0, 110.0], "iv": [0.2, 0.21, 0.22],
+        "maturity": 2.0, "implied_forward": 100.0,
+    })
+    surface = VolSurface.fit(pd.concat([surface_df, junk]), model="svi")
+    report = surface.fit_report
+    assert not report.ok and report.n_failed == 1
+    bad = [s for s in report.slices if s.status != "ok"]
+    assert bad[0].maturity == 2.0 and bad[0].status == "insufficient_data"
+    assert bad[0].n_quotes == 3 and bad[0].n_used == 0
+    assert "ATTENTION" in report.summary()
+
+
+def test_fit_report_records_settings():
+    surface_kwargs = {"loss": "soft_l1", "initialization": "multi_start"}
+    import pandas as pd
+    df = pd.DataFrame({
+        "strike": 100.0 * np.exp(np.linspace(-0.2, 0.2, 15)),
+        "iv": 0.2 + 0.05 * np.abs(np.linspace(-0.2, 0.2, 15)),
+        "maturity": 0.5, "implied_forward": 100.0,
+    })
+    surface = VolSurface.fit(df, model="svi", **surface_kwargs)
+    report = surface.fit_report
+    assert report.loss == "soft_l1"
+    assert report.initialization == "multi_start"
+    assert report.objective == "total_variance"
+    assert report.backend in ("numba", "numpy")
+    assert report.pysvi_version and report.created_utc.endswith("Z")
+
+
+def test_diagnose_combined_block(svi_surface):
+    diag = svi_surface.diagnose()
+    assert diag.ok
+    assert diag.fit is svi_surface.fit_report
+    # default grid is the quoted range, not the wide diagnostics default
+    assert diag.arbitrage.slices[0].k_min == pytest.approx(-0.75)
+    text = str(diag)
+    assert "SurfaceFitReport" in text
+    assert "Arbitrage diagnostics" in text
+    assert "Overall: OK" in text
+
+
+def test_diagnose_direct_construction(svi_surface):
+    rebuilt = VolSurface(
+        svi_surface.model,
+        {T: svi_surface.params(T) for T in svi_surface.maturities},
+    )
+    assert rebuilt.fit_report is None
+    diag = rebuilt.diagnose(k_data=np.linspace(-0.25, 0.25, 5))
+    assert "not available" in str(diag)
+    assert diag.ok == diag.arbitrage.ok
