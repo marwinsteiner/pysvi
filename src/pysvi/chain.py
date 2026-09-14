@@ -164,6 +164,11 @@ class OptionChain:
                 K = float(K)
                 flag = "c" if K >= F else "p"
                 mid = choose_leg(K, F, row.get("mid_c", np.nan), row.get("mid_p", np.nan))
+                if not np.isfinite(row.get(f"mid_{flag}", np.nan)):
+                    # choose_leg fell back to the ITM leg; the inversion
+                    # flag must follow it, or the ITM price reads as an
+                    # absurd-but-finite OTM vol instead of failing.
+                    flag = "p" if flag == "c" else "c"
                 bid_px = row.get(f"bid_{flag}", np.nan)
                 ask_px = row.get(f"ask_{flag}", np.nan)
                 rows.append({

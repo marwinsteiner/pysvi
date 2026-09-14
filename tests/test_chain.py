@@ -106,6 +106,27 @@ def test_invalid_rows_dropped_and_cp_validated(raw_chain):
         OptionChain.from_dataframe(bad, rate=R)
 
 
+def test_itm_fallback_inverts_with_matching_flag(raw_chain):
+    """A strike quoting only the ITM leg must not produce a garbage IV.
+
+    With the put missing below F, choose_leg falls back to the call
+    (deep ITM, mostly intrinsic). Inverting that price with the put
+    flag yields an absurd-but-finite vol; the flag must follow the leg.
+    """
+    T, F = 0.25, 100.0 * np.exp(R * 0.25)
+    k_low = -0.15
+    K_low = F * np.exp(k_low)
+    raw = raw_chain[~((raw_chain["cp"] == "p")
+                      & (np.abs(raw_chain["strike"] - K_low) < 1e-9)
+                      & (raw_chain["expiry"] == T))]
+    chain = OptionChain.from_dataframe(raw, rate=R)
+    g = chain.panel
+    row = g[(g["maturity"] == T) & (np.abs(g["strike"] - K_low) < 1e-9)]
+    iv_true = float(np.sqrt(svi_total_variance(np.array([k_low]), **BASE))[0]
+                    / np.sqrt(0.25))
+    assert float(row["iv"].iloc[0]) == pytest.approx(iv_true, abs=0.01)
+
+
 def test_custom_column_names(raw_chain):
     renamed = raw_chain.rename(columns={
         "strike": "K", "expiry": "tte", "cp": "flag", "bid": "b", "ask": "a",
