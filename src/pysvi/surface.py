@@ -35,7 +35,8 @@ from scipy.special import ndtr
 
 from . import _kernels
 from .models import (
-    ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, Parametrization, SABR, SSVI,
+    ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, NaturalSVI, Parametrization,
+    SABR, SSVI, SVI,
     _initialization, _minimize_with_starts, _multistart_variants, _penalty_grid,
     _prepare_loss_inputs, essvi_total_variance,
 )
@@ -49,6 +50,14 @@ from .report import (
 
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
 _INTERP_METHODS = ("total_variance", "theta")
+
+#: Serialization schema version written by VolSurface.save.
+_SCHEMA_VERSION = 1
+
+_MODEL_CLASSES = {
+    cls.__name__: cls
+    for cls in (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR)
+}
 
 
 def _npdf(x):
@@ -453,6 +462,76 @@ class VolSurface:
         return SurfaceDiagnostics(
             fit=self.fit_report,
             arbitrage=self.check_arbitrage(**kwargs),
+        )
+
+    # ── Serialization ────────────────────────────────────────────────
+
+    def save(self, path) -> None:
+        """Write the surface to ``path`` as versioned JSON.
+
+        The schema captures everything evaluation needs — model name and
+        arbitrage condition, per-slice maturities and parameters
+        (forwards included), the flat rate, the interpolation method —
+        plus the fit report and provenance when present. Calibrating is
+        expensive and evaluating is cheap: save once, distribute, and
+        :meth:`load` reproduces evaluation exactly.
+        """
+        import json
+        from dataclasses import asdict
+
+        from .report import _pysvi_version
+
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "pysvi_version": _pysvi_version(),
+            "model": type(self.model).__name__,
+            "arbitrage_condition": int(self.model.arbitrage_condition.value),
+            "r": self.r,
+            "interp_method": self.interp_method,
+            "slices": [
+                {"maturity": T, "params": params} for T, params in self._slices
+            ],
+            "fit_report": asdict(self.fit_report) if self.fit_report else None,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+    @classmethod
+    def load(cls, path) -> "VolSurface":
+        """Reconstruct a surface saved by :meth:`save`.
+
+        Validates the schema version and model name; raises ValueError
+        on an unknown schema or model.
+        """
+        import json
+
+        from .report import SliceFitReport, SurfaceFitReport
+
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        version = payload.get("schema_version")
+        if version != _SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported surface schema_version {version!r} "
+                f"(this pysvi reads version {_SCHEMA_VERSION})"
+            )
+        model_cls = _MODEL_CLASSES.get(payload.get("model"))
+        if model_cls is None:
+            raise ValueError(f"unknown model {payload.get('model')!r} in surface file")
+        model = model_cls(
+            arbitrage_condition=ArbitrageFreedom(payload.get("arbitrage_condition", 0))
+        )
+        report = None
+        if payload.get("fit_report"):
+            raw = dict(payload["fit_report"])
+            raw["slices"] = tuple(SliceFitReport(**item) for item in raw["slices"])
+            report = SurfaceFitReport(**raw)
+        return cls(
+            model,
+            [(item["maturity"], item["params"]) for item in payload["slices"]],
+            r=payload.get("r", 0.0),
+            interp_method=payload.get("interp_method", "total_variance"),
+            fit_report=report,
         )
 
     # ── Black-76 pricing and Greeks ──────────────────────────────────
