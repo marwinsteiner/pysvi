@@ -18,6 +18,7 @@ from .calibration import (prepare_slice, calibrate_slice, apply_slice,
 from .diagnostics import (check_slice_arbitrage, check_arbitrage,
                           SliceArbitrageReport, ArbitrageReport, LEE_BOUND)
 from .surface import VolSurface
+from .report import (SurfaceFitReport, SliceFitReport, SurfaceDiagnostics)
 
 __all__ = [
     "SVI", "NaturalSVI", "SSVI", "ESSVI", "JumpWings", "DirectSVI", "SABR",
@@ -30,5 +31,6 @@ __all__ = [
     "check_slice_arbitrage", "check_arbitrage",
     "SliceArbitrageReport", "ArbitrageReport", "LEE_BOUND",
     "VolSurface",
+    "SurfaceFitReport", "SliceFitReport", "SurfaceDiagnostics",
     "prepare_slice", "calibrate_slice", "apply_slice", "calculate_implied_forward"
 ]
