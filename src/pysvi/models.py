@@ -565,55 +565,58 @@ def _baseline_options(init, mode, loss_code):
 
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
                           nm_options=None, baseline_options=None):
-    """L-BFGS-B from each start, keeping the best result by objective value.
+    """L-BFGS-B from each start, keeping the best converged endpoint.
 
-    Selection compares final objective values over every run with a
-    finite result, converged or not: under very tight tolerances
-    L-BFGS-B routinely terminates ABNORMAL (line search exhausted below
-    the achievable precision) while sitting at an excellent point, and
-    requiring ``success`` throws exactly those basins away. A
-    non-converged point with the lowest objective is still the best
-    point found.
+    A run that does not converge is polished: restarted from its stall
+    point under default (looser) tolerances. Under the tight
+    multi-start tolerances L-BFGS-B routinely terminates ABNORMAL (line
+    search exhausted below the achievable precision) near an excellent
+    minimum -- and scipy then reports the LAST iterate, not the best
+    visited -- so discarding those runs throws good basins away, while
+    comparing their raw reported values biases the selection. The
+    polish settles each stalled run into a clean FACTR-converged
+    endpoint, making all candidates comparable minima of the penalized
+    objective. (Only settled endpoints may win: a raw mid-trajectory
+    point can undercut the objective while violating the soft arbitrage
+    penalties.)
 
     ``baseline_options`` (used by multi-start) additionally runs the
     first start -- the default initialization -- under the options the
     single-start path would use, so the multi-start result can never be
-    worse than the default path it replaces. This matters because on
-    ABNORMAL termination scipy reports the last iterate, not the best
-    visited: the tight run of the base start can end above where the
-    default-tolerance run stops.
+    worse than the default path it replaces.
 
-    Falls back to Nelder-Mead from the first start when no L-BFGS-B run
-    converged; returns the scipy result, or None on total failure.
+    Falls back to Nelder-Mead from the first start when no run yields a
+    converged endpoint. Returns the scipy result, or None on total
+    failure.
     """
     from scipy.optimize import minimize
 
-    runs = [(x0, lbfgs_options or {}) for x0 in starts]
+    polish_options = baseline_options or {}
+    runs = [(x0, lbfgs_options or {}, True) for x0 in starts]
     if baseline_options is not None:
-        runs.append((starts[0], baseline_options))
+        runs.append((starts[0], baseline_options, False))
     best = None
-    any_converged = False
-    for x0, opts in runs:
+    for x0, opts, may_polish in runs:
         res = minimize(
             objective, x0, method="L-BFGS-B", bounds=bounds, options=opts,
         )
-        any_converged = any_converged or bool(res.success)
-        if (
-            np.isfinite(res.fun) and np.all(np.isfinite(res.x))
-            and (best is None or res.fun < best.fun)
-        ):
-            best = res
-    if not any_converged:
-        res = minimize(
-            objective, starts[0], method="Nelder-Mead",
-            options=nm_options if nm_options is not None else {},
-        )
+        if not res.success and may_polish and np.all(np.isfinite(res.x)):
+            res = minimize(
+                objective, res.x, method="L-BFGS-B", bounds=bounds,
+                options=polish_options,
+            )
         if (
             res.success and np.isfinite(res.fun) and np.all(np.isfinite(res.x))
             and (best is None or res.fun < best.fun)
         ):
             best = res
-    return best
+    if best is not None:
+        return best
+    res = minimize(
+        objective, starts[0], method="Nelder-Mead",
+        options=nm_options if nm_options is not None else {},
+    )
+    return res if res.success else None
 
 
 class Parametrization(ABC):
