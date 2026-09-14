@@ -63,7 +63,7 @@ F = float(df_slice["implied_forward"].iloc[0])
 params = calibrate_slice(df_slice, model, T=T, F=F, beta=1.0)  # beta=1 for FX/equity
 ```
 
-See {doc}`models/index` for the full catalogue and when to use which model.
+See {doc}`models/index` for the full catalogue and when to use which model. For the complete pipeline from raw call/put quotes to a verified, persisted surface, see {doc}`example`.
 
 ## Numba acceleration
 
