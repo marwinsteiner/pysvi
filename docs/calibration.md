@@ -58,7 +58,7 @@ If you're starting from raw option prices rather than implied vols:
 
 ### Implied forwards
 
-`calculate_implied_forward` estimates the forward price from put-call parity:
+`calculate_implied_forward` estimates the forward price from put-call parity; the rate may be a flat float or a callable term structure $T \mapsto r(T)$:
 
 $$F = K + e^{rT}(C - P)$$
 
