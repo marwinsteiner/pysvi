@@ -559,29 +559,71 @@ def _tight_if_controls(init, mode, loss_code):
     return None
 
 
-def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None, nm_options=None):
-    """L-BFGS-B from each start, keeping the best converged result.
+def _baseline_options(init, mode, loss_code):
+    """Options for multi-start's extra default-start run (None otherwise).
 
-    Falls back to Nelder-Mead from the first start when no start
-    converges. Returns the scipy result, or None on total failure.
+    Multi-start runs its grid under tight tolerances, which the plain
+    default path does not use; the baseline run repeats the default
+    start under exactly the options the default path would use, so
+    ``initialization='multi_start'`` can never return a worse fit than
+    ``initialization='default'`` with the same controls.
+    """
+    if init != "multi_start":
+        return None
+    return _tight_if_controls("default", mode, loss_code) or {}
+
+
+def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
+                          nm_options=None, baseline_options=None):
+    """L-BFGS-B from each start, keeping the best result by objective value.
+
+    Selection compares final objective values over every run with a
+    finite result, converged or not: under very tight tolerances
+    L-BFGS-B routinely terminates ABNORMAL (line search exhausted below
+    the achievable precision) while sitting at an excellent point, and
+    requiring ``success`` throws exactly those basins away. A
+    non-converged point with the lowest objective is still the best
+    point found.
+
+    ``baseline_options`` (used by multi-start) additionally runs the
+    first start -- the default initialization -- under the options the
+    single-start path would use, so the multi-start result can never be
+    worse than the default path it replaces. This matters because on
+    ABNORMAL termination scipy reports the last iterate, not the best
+    visited: the tight run of the base start can end above where the
+    default-tolerance run stops.
+
+    Falls back to Nelder-Mead from the first start when no L-BFGS-B run
+    converged; returns the scipy result, or None on total failure.
     """
     from scipy.optimize import minimize
 
+    runs = [(x0, lbfgs_options or {}) for x0 in starts]
+    if baseline_options is not None:
+        runs.append((starts[0], baseline_options))
     best = None
-    for x0 in starts:
+    any_converged = False
+    for x0, opts in runs:
         res = minimize(
-            objective, x0, method="L-BFGS-B", bounds=bounds,
-            options=lbfgs_options or {},
+            objective, x0, method="L-BFGS-B", bounds=bounds, options=opts,
         )
-        if res.success and (best is None or res.fun < best.fun):
+        any_converged = any_converged or bool(res.success)
+        if (
+            np.isfinite(res.fun) and np.all(np.isfinite(res.x))
+            and (best is None or res.fun < best.fun)
+        ):
             best = res
-    if best is not None:
-        return best
-    res = minimize(
-        objective, starts[0], method="Nelder-Mead",
-        options=nm_options if nm_options is not None else {},
-    )
-    return res if res.success else None
+    if not any_converged:
+        res = minimize(
+            objective, starts[0], method="Nelder-Mead",
+            options=nm_options if nm_options is not None else {},
+        )
+        if (
+            res.success and np.isfinite(res.fun) and np.all(np.isfinite(res.x))
+            and (best is None or res.fun < best.fun)
+        ):
+            best = res
+    return best
 
 
 class Parametrization(ABC):
@@ -620,8 +662,10 @@ class Parametrization(ABC):
               1.4826 * MAD of the residuals at a pilot l2 fit.
             * initialization : str, default 'default' — 'default',
               'jump_wings' (SVI/NaturalSVI only: data-driven wing
-              readoff), or 'multi_start' (deterministic start grid,
-              best converged result wins).
+              readoff), or 'multi_start' (deterministic start grid;
+              the lowest-objective result wins, and the default start
+              also runs under the default path's settings, so
+              multi_start is never worse than default).
 
         Returns
         -------
@@ -844,6 +888,7 @@ class SVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             nm_options={"maxiter": 2000},
+            baseline_options=_baseline_options(init, mode, loss_code),
         )
         if res is None:
             return None
@@ -1098,6 +1143,7 @@ class SSVI(Parametrization):
         res = _minimize_with_starts(
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
+            baseline_options=_baseline_options(init, mode, loss_code),
         )
         if res is None:
             return None
@@ -1209,6 +1255,7 @@ class ESSVI(Parametrization):
         res = _minimize_with_starts(
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
+            baseline_options=_baseline_options(init, mode, loss_code),
         )
         if res is None:
             return None
@@ -1362,6 +1409,7 @@ class JumpWings(Parametrization):
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             nm_options={"maxiter": 2000},
+            baseline_options=_baseline_options(init, mode, loss_code),
         )
         if res is None:
             return None
