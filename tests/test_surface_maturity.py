@@ -213,3 +213,89 @@ def test_calibrate_surface_report_essvi_global(surface_df):
     report = surface.fit_report
     assert report.n_ok == 3
     assert all(s.iv_rmse is not None for s in report.slices)
+
+
+# ── C1 maturity interpolation (issue #22) ────────────────────────────
+
+def _multi_T_panel(maturities=(0.25, 0.5, 1.0, 2.0)):
+    rows = []
+    for T in maturities:
+        F = 100.0 * np.exp(R * T)
+        k = np.linspace(-0.3, 0.3, 21)
+        iv = np.sqrt(svi_total_variance(
+            k, 0.01, 0.12, -0.6, 0.01, 0.25) * (T / 0.25) / T)
+        for ki, vi in zip(k, iv):
+            rows.append({"strike": F * np.exp(ki), "iv": vi,
+                         "maturity": T, "implied_forward": F})
+    return pd.DataFrame(rows)
+
+
+def test_regularity_reported_per_method(surface_df):
+    s0 = VolSurface.fit(surface_df, model="svi", r=R)
+    assert s0.regularity == "C0"
+    st = calibrate_surface(surface_df, model="ssvi", r=R, interp_method="theta")
+    assert st.regularity == "C0"
+    s1 = VolSurface.fit(surface_df, model="svi", r=R,
+                        interp_method="monotone_cubic")
+    assert s1.regularity == "C1"
+
+
+def test_monotone_cubic_exact_at_knots_and_c1():
+    surface = VolSurface.fit(_multi_T_panel(), model="svi", r=R,
+                             interp_method="monotone_cubic",
+                             initialization="multi_start")
+    K = np.array([95.0, 100.0, 105.0])
+    for T in surface.maturities:
+        exact = surface.model.total_variance(
+            np.log(K / surface.forward(T)), surface.params(T))
+        np.testing.assert_allclose(
+            surface.total_variance(np.log(K / surface.forward(T)), T),
+            exact, rtol=1e-12)
+    # dw/dT continuous across an interior knot
+    eps = 1e-7
+    left = surface.dw_dT(0.0, 0.5 - eps)
+    right = surface.dw_dT(0.0, 0.5 + eps)
+    assert abs(left - right) < 1e-4
+    # exact-knot query is also defined
+    assert np.isfinite(surface.dw_dT(0.0, 0.5))
+
+
+def test_monotone_cubic_preserves_calendar():
+    surface = VolSurface.fit(_multi_T_panel(), model="svi", r=R,
+                             interp_method="monotone_cubic",
+                             initialization="multi_start")
+    for k_val in (-0.2, 0.0, 0.2):
+        Ts = np.linspace(0.251, 1.999, 60)
+        w = np.array([surface.total_variance(k_val, T) for T in Ts])
+        assert np.all(np.diff(w) > -1e-12), f"calendar broken at k={k_val}"
+
+
+def test_dw_dT_refused_on_c0_surfaces(surface_df):
+    surface = VolSurface.fit(surface_df, model="svi", r=R)
+    with pytest.raises(ValueError, match="C1"):
+        surface.dw_dT(0.0, 0.4)
+
+
+def test_monotone_cubic_needs_two_slices():
+    panel = _multi_T_panel(maturities=(0.5,))
+    with pytest.raises(ValueError, match="two"):
+        VolSurface.fit(panel, model="svi", r=R,
+                       interp_method="monotone_cubic")
+
+
+def test_monotone_cubic_greeks_and_serialization(tmp_path):
+    surface = VolSurface.fit(_multi_T_panel(), model="svi", r=R,
+                             interp_method="monotone_cubic",
+                             initialization="multi_start")
+    K = np.array([95.0, 105.0])
+    assert np.all(np.isfinite(surface.skew(0.7) + surface.curvature(0.7)))
+    assert np.all(np.isfinite(surface.gamma(K, 0.7)))
+    path = tmp_path / "c1.json"
+    surface.save(path)
+    loaded = VolSurface.load(path)
+    assert loaded.interp_method == "monotone_cubic"
+    assert loaded.regularity == "C1"
+    np.testing.assert_array_equal(loaded.iv(K, 0.7), surface.iv(K, 0.7))
+    np.testing.assert_array_equal(
+        np.atleast_1d(loaded.dw_dT(0.0, 0.7)),
+        np.atleast_1d(surface.dw_dT(0.0, 0.7)))
