@@ -45,11 +45,14 @@ from .diagnostics import ArbitrageReport, check_arbitrage
 from .report import (
     SLICE_FAILED, SLICE_INSUFFICIENT, SLICE_OK,
     SurfaceDiagnostics, SurfaceFitReport,
-    build_slice_report, build_surface_report,
+    build_slice_report, build_surface_report, validate_mode,
 )
 
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
-_INTERP_METHODS = ("total_variance", "theta")
+_INTERP_METHODS = ("total_variance", "theta", "monotone_cubic")
+
+#: Smoothness in maturity guaranteed by each interpolation method.
+_REGULARITY = {"total_variance": "C0", "theta": "C0", "monotone_cubic": "C1"}
 
 #: Serialization schema version written by VolSurface.save.
 _SCHEMA_VERSION = 1
@@ -134,6 +137,13 @@ class VolSurface:
         calendar-free whenever the bracketing slices are). "theta"
         (SSVI/eSSVI only) interpolates the ATM total variance and shape
         parameters, yielding a genuine parametric slice at any maturity.
+        "monotone_cubic" is a shape-preserving cubic (PCHIP,
+        Fritsch-Carlson) in maturity at fixed log-moneyness across ALL
+        fitted slices: continuously differentiable in T (C1, see
+        :attr:`regularity` and :meth:`dw_dT`), exact at fitted
+        maturities, and monotone in T wherever the fitted slices are --
+        so calendar-free slices stay calendar-free between expiries.
+        Requires at least two fitted slices.
     fit_report : SurfaceFitReport, optional
         Calibration provenance and per-slice evidence; populated by
         :meth:`fit` and :func:`calibrate_surface`, None on direct
@@ -176,6 +186,11 @@ class VolSurface:
             raise ValueError(
                 "interp_method='theta' requires an SSVI or eSSVI model"
             )
+        if interp_method == "monotone_cubic" and len(ordered) < 2:
+            raise ValueError(
+                "interp_method='monotone_cubic' requires at least two "
+                "fitted slices"
+            )
         self.model = model
         self.r = float(r)
         self.interp_method = interp_method
@@ -192,6 +207,7 @@ class VolSurface:
         arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI,
         r: float = 0.0,
         interp_method: str = "total_variance",
+        mode: str = "warn",
         **model_kwargs,
     ) -> "VolSurface":
         """Calibrate every maturity slice of an option panel independently.
@@ -222,6 +238,12 @@ class VolSurface:
             Flat discount rate for the pricing layer.
         interp_method : str, default "total_variance"
             Maturity interpolation method (see the class docstring).
+        mode : str, default "warn"
+            Failure handling for slices. ``"strict"``: the first slice
+            that is too thin to calibrate or fails to converge raises
+            with its maturity. ``"warn"``: skipped with a logged
+            warning. ``"lenient"``: skipped silently. Every mode
+            records the failure on the fit report.
         **model_kwargs
             Forwarded to every per-slice calibration.
 
@@ -229,6 +251,7 @@ class VolSurface:
         -------
         VolSurface
         """
+        validate_mode(mode)
         instance = (
             get_model(model, arbitrage_condition)
             if isinstance(model, str) else model
@@ -250,18 +273,30 @@ class VolSurface:
             n_quotes = len(g)
             k, w, F = prepare_slice(g)
             if k is None:
-                logger.warning(
-                    f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
-                )
+                if mode == "strict":
+                    raise ValueError(
+                        f"VolSurface.fit(mode='strict'): slice T={T:g} has "
+                        f"insufficient data ({n_quotes} quotes before cleaning)"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
+                    )
                 slice_reports.append(
                     build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
                 )
                 continue
             params = instance.calibrate(k, w, **kwargs)
             if params is None:
-                logger.warning(
-                    f"VolSurface.fit: slice T={T:g} failed to calibrate; skipping"
-                )
+                if mode == "strict":
+                    raise ValueError(
+                        f"VolSurface.fit(mode='strict'): slice T={T:g} "
+                        "failed to calibrate"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"VolSurface.fit: slice T={T:g} failed to calibrate; skipping"
+                    )
                 slice_reports.append(
                     build_slice_report(T, SLICE_FAILED, n_quotes, k=k)
                 )
@@ -352,9 +387,10 @@ class VolSurface:
             return dict(loc[2])
         if self.interp_method != "theta":
             raise ValueError(
-                "slice_at between fitted maturities requires "
-                "interp_method='theta' (the total-variance blend has no "
-                "parameter representation); evaluation methods such as "
+                "slice_at between fitted maturities requires a parametric "
+                "interpolation (interp_method='theta'); the total-variance "
+                "and monotone_cubic blends have no parameter "
+                "representation. Evaluation methods such as "
                 "iv/total_variance/price work at any maturity in range"
             )
         return self._theta_params(loc[1], loc[2], loc[3])
@@ -375,6 +411,16 @@ class VolSurface:
 
     # ── Evaluation ───────────────────────────────────────────────────
 
+    def _pchip(self, k: np.ndarray):
+        """Shape-preserving cubic in T at fixed k, over all fitted slices."""
+        from scipy.interpolate import PchipInterpolator
+
+        T_knots = np.array([T for T, _ in self._slices])
+        W = np.vstack([
+            self.model.total_variance(k, params) for _, params in self._slices
+        ])
+        return PchipInterpolator(T_knots, W, axis=0, extrapolate=False)
+
     def _w_at(self, k: np.ndarray, maturity) -> np.ndarray:
         loc = self._locate(maturity)
         if loc[0] == "exact":
@@ -382,6 +428,8 @@ class VolSurface:
         lo, hi, lam = loc[1], loc[2], loc[3]
         if self.interp_method == "theta":
             return self.model.total_variance(k, self._theta_params(lo, hi, lam))
+        if self.interp_method == "monotone_cubic":
+            return self._pchip(k)(float(maturity))
         w_lo = self.model.total_variance(k, lo[1])
         w_hi = self.model.total_variance(k, hi[1])
         return (1.0 - lam) * w_lo + lam * w_hi
@@ -394,8 +442,60 @@ class VolSurface:
         lo, hi, lam = loc[1], loc[2], loc[3]
         if self.interp_method == "theta":
             return deriv(k, self._theta_params(lo, hi, lam))
+        if self.interp_method == "monotone_cubic":
+            # PCHIP slopes are nonlinear in the knot values, so the
+            # k-derivative of the interpolant is not the interpolant of
+            # the k-derivatives; central differences on the surface.
+            h = self.model.fd_step
+            fn = self._pchip(np.concatenate([k - h, k, k + h]))
+            row = fn(float(maturity))
+            n = k.shape[0]
+            w_m, w_0, w_p = row[:n], row[n:2 * n], row[2 * n:]
+            if second:
+                return (w_p - 2.0 * w_0 + w_m) / (h * h)
+            return (w_p - w_m) / (2.0 * h)
         # derivative of the linear blend is the blend of derivatives
         return (1.0 - lam) * deriv(k, lo[1]) + lam * deriv(k, hi[1])
+
+    @property
+    def regularity(self) -> str:
+        """Smoothness guarantee of the surface in maturity: "C0" or "C1".
+
+        "C0" (the default total-variance blend and the theta method):
+        w(k, T) is continuous in T but its maturity derivative jumps at
+        every fitted slice. Ready for implied vols, prices, and
+        sticky-strike Greeks; NOT ready for quantities that consume
+        dw/dT -- Dupire local volatility, forward variance, PDE
+        coefficients -- whose inputs would be discontinuous.
+
+        "C1" (interp_method="monotone_cubic"): dw/dT exists and is
+        continuous everywhere in the fitted maturity range (exposed via
+        :meth:`dw_dT`), making the surface Dupire-ready in maturity.
+        Smoothness in strike comes from the model itself and is
+        analytic (C-infinity) for the SVI family either way.
+        """
+        return _REGULARITY[self.interp_method]
+
+    def dw_dT(self, k, maturity):
+        """Maturity derivative of total variance, dw/dT at fixed k.
+
+        The Dupire numerator. Only available when the interpolation
+        method is C1 in maturity (interp_method="monotone_cubic");
+        the C0 methods have jump discontinuities at the fitted slices,
+        and a one-sided number there would be silently wrong.
+        """
+        if self.regularity != "C1":
+            raise ValueError(
+                f"dw_dT requires a C1 maturity interpolation; this surface "
+                f"uses interp_method={self.interp_method!r} (regularity "
+                f"{self.regularity}). Refit or construct with "
+                "interp_method='monotone_cubic'."
+            )
+        T = float(maturity)
+        self._locate(T)  # range check (raises outside the fitted range)
+        k_arr = np.atleast_1d(np.asarray(k, dtype=np.float64))
+        values = self._pchip(k_arr).derivative()(T)
+        return _shape_like(values, k)
 
     def total_variance(self, k, maturity):
         """Total variance w(k) at any maturity in the fitted range."""
@@ -641,6 +741,7 @@ def calibrate_surface(
     arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI,
     r: float = 0.0,
     interp_method: str = "total_variance",
+    mode: str = "warn",
     **model_kwargs,
 ) -> VolSurface:
     """Calendar-aware multi-expiry calibration returning a VolSurface.
@@ -686,6 +787,7 @@ def calibrate_surface(
     -------
     VolSurface
     """
+    validate_mode(mode)
     if isinstance(model, str):
         condition = arbitrage_condition
         if enforce_calendar:
@@ -716,9 +818,15 @@ def calibrate_surface(
     for T, g in groups:
         k_i, w_i, F_i = prepare_slice(g)
         if k_i is None:
-            logger.warning(
-                f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
-            )
+            if mode == "strict":
+                raise ValueError(
+                    f"calibrate_surface(mode='strict'): slice T={T:g} has "
+                    f"insufficient data ({len(g)} quotes before cleaning)"
+                )
+            if mode == "warn":
+                logger.warning(
+                    f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
+                )
             slice_reports.append(
                 build_slice_report(T, SLICE_INSUFFICIENT, len(g))
             )
@@ -755,9 +863,15 @@ def calibrate_surface(
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
             params = instance.calibrate(k_i, w_i, **kwargs)
             if params is None:
-                logger.warning(
-                    f"calibrate_surface: slice T={T:g} failed to calibrate; skipping"
-                )
+                if mode == "strict":
+                    raise ValueError(
+                        f"calibrate_surface(mode='strict'): slice T={T:g} "
+                        "failed to calibrate"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"calibrate_surface: slice T={T:g} failed to calibrate; skipping"
+                    )
                 continue
             params["forward"] = F_i
             slices.append((T, params))

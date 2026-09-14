@@ -19,11 +19,13 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 from loguru import logger
-from py_lets_be_rational.exceptions import BelowIntrinsicException
+from py_lets_be_rational.exceptions import (AboveMaximumException,
+                                             BelowIntrinsicException)
 from py_vollib.black.implied_volatility import implied_volatility as _black_iv
 
 from .calibration import _rate_at, calculate_implied_forward, choose_leg
 from .models import ArbitrageFreedom, Parametrization
+from .report import validate_mode
 from .surface import VolSurface, calibrate_surface
 
 RateLike = Union[float, "callable"]
@@ -35,7 +37,8 @@ def _invert_iv(price, F, K, r, T, flag) -> float:
         return float("nan")
     try:
         return float(_black_iv(float(price), float(F), float(K), float(r), float(T), flag))
-    except (BelowIntrinsicException, ValueError, ZeroDivisionError, OverflowError):
+    except (BelowIntrinsicException, AboveMaximumException,
+            ValueError, ZeroDivisionError, OverflowError):
         return float("nan")
 
 
@@ -48,9 +51,15 @@ class OptionChain:
     fit a surface with :meth:`fit`.
     """
 
-    def __init__(self, panel: pd.DataFrame, rate: RateLike = 0.0) -> None:
+    def __init__(self, panel: pd.DataFrame, rate: RateLike = 0.0,
+                 rejections: Optional[dict] = None) -> None:
         self._panel = panel.reset_index(drop=True)
         self.rate = rate
+        #: Ingestion accounting: {"rejected_quotes", "failed_inversions",
+        #: "skipped_expiries" (list of T)}. Populated by from_dataframe.
+        self.rejections = rejections or {
+            "rejected_quotes": 0, "failed_inversions": 0, "skipped_expiries": [],
+        }
 
     @property
     def panel(self) -> pd.DataFrame:
@@ -73,6 +82,7 @@ class OptionChain:
         spot: Optional[float] = None,
         rate: RateLike = 0.0,
         dividend_yield: RateLike = 0.0,
+        mode: str = "warn",
     ) -> "OptionChain":
         """Ingest raw call/put quotes into a calibration-ready chain.
 
@@ -99,11 +109,22 @@ class OptionChain:
         dividend_yield : float or callable, default 0.0
             Continuous dividend yield for the forward fallback only
             (put-call-parity forwards embed dividends already).
+        mode : str, default "warn"
+            Failure handling. ``"strict"``: the first bad input raises
+            with its location (invalid quote rows, an expiry that
+            cannot form a forward, a mid quote whose implied vol will
+            not invert). ``"warn"``: problems are logged and recorded.
+            ``"lenient"``: problems are filtered silently but still
+            recorded. All modes record counts on :attr:`rejections`,
+            and :meth:`fit` carries them onto the surface's fit report
+            -- nothing disappears without a count. Unrecognized ``cp``
+            values raise in every mode (schema error, not bad data).
 
         Returns
         -------
         OptionChain
         """
+        validate_mode(mode)
         data = pd.DataFrame({
             "strike": pd.to_numeric(df[strike], errors="coerce"),
             "maturity": pd.to_numeric(df[expiry], errors="coerce"),
@@ -123,13 +144,23 @@ class OptionChain:
         )
         n_dropped = int((~valid).sum())
         if n_dropped:
-            logger.warning(f"OptionChain: dropped {n_dropped} invalid quote rows")
+            if mode == "strict":
+                bad_rows = df.index[~valid.to_numpy()].tolist()
+                raise ValueError(
+                    f"OptionChain(mode='strict'): {n_dropped} invalid quote "
+                    f"rows (non-positive strike/expiry/ask, or crossed "
+                    f"bid > ask); first offenders at input rows "
+                    f"{bad_rows[:5]}"
+                )
+            if mode == "warn":
+                logger.warning(f"OptionChain: dropped {n_dropped} invalid quote rows")
         data = data[valid].copy()
         if data.empty:
             raise ValueError("OptionChain: no valid quotes after cleaning")
         data["mid"] = 0.5 * (data["bid"] + data["ask"])
 
         rows = []
+        skipped_expiries = []
         for T, g in sorted(data.groupby("maturity"), key=lambda item: item[0]):
             T = float(T)
             r_T = float(_rate_at(rate, T))
@@ -150,13 +181,27 @@ class OptionChain:
                 q_T = float(_rate_at(dividend_yield, T))
                 F = float(spot) * float(np.exp((r_T - q_T) * T))
             else:
-                logger.warning(
-                    f"OptionChain: expiry T={T:g} has no put-call pairs and no "
-                    "spot for a forward fallback; skipping"
-                )
+                if mode == "strict":
+                    raise ValueError(
+                        f"OptionChain(mode='strict'): expiry T={T:g} has no "
+                        "put-call pairs and no spot for a forward fallback"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"OptionChain: expiry T={T:g} has no put-call pairs and no "
+                        "spot for a forward fallback; skipping"
+                    )
+                skipped_expiries.append(T)
                 continue
             if not np.isfinite(F) or F <= 0:
-                logger.warning(f"OptionChain: expiry T={T:g} implied forward invalid; skipping")
+                if mode == "strict":
+                    raise ValueError(
+                        f"OptionChain(mode='strict'): expiry T={T:g} implied "
+                        f"forward invalid ({F!r})"
+                    )
+                if mode == "warn":
+                    logger.warning(f"OptionChain: expiry T={T:g} implied forward invalid; skipping")
+                skipped_expiries.append(T)
                 continue
 
             merged = calls.join(puts, how="outer", lsuffix="_c", rsuffix="_p")
@@ -171,17 +216,29 @@ class OptionChain:
                     flag = "p" if flag == "c" else "c"
                 bid_px = row.get(f"bid_{flag}", np.nan)
                 ask_px = row.get(f"ask_{flag}", np.nan)
+                iv = _invert_iv(mid, F, K, r_T, T, flag)
+                if not np.isfinite(iv) and mode == "strict":
+                    raise ValueError(
+                        f"OptionChain(mode='strict'): mid quote at strike "
+                        f"{K:g}, expiry T={T:g} does not invert to an "
+                        f"implied vol (mid={mid!r}, forward={F:g})"
+                    )
                 rows.append({
                     "strike": K,
                     "maturity": T,
                     "implied_forward": F,
-                    "iv": _invert_iv(mid, F, K, r_T, T, flag),
+                    "iv": iv,
                     "iv_bid": _invert_iv(bid_px, F, K, r_T, T, flag),
                     "iv_ask": _invert_iv(ask_px, F, K, r_T, T, flag),
                 })
         if not rows:
             raise ValueError("OptionChain: no expiry produced a usable slice")
-        return cls(pd.DataFrame(rows), rate=rate)
+        panel = pd.DataFrame(rows)
+        return cls(panel, rate=rate, rejections={
+            "rejected_quotes": n_dropped,
+            "failed_inversions": int(panel["iv"].isna().sum()),
+            "skipped_expiries": skipped_expiries,
+        })
 
     def fit(
         self,
@@ -189,6 +246,7 @@ class OptionChain:
         enforce_calendar: bool = False,
         arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI,
         r: Optional[float] = None,
+        mode: str = "warn",
         **model_kwargs,
     ) -> VolSurface:
         """Calibrate a surface from the chain in one call.
@@ -197,16 +255,33 @@ class OptionChain:
         set, else :meth:`VolSurface.fit`. ``r`` sets the surface's flat
         pricing rate; when omitted it defaults to the chain's rate if
         that is a flat float, else 0.0 (a callable term structure has no
-        flat representation on the surface yet).
+        flat representation on the surface yet). ``mode`` sets the
+        failure handling for the fit (see :meth:`from_dataframe`); the
+        chain's ingestion accounting is carried onto the returned
+        surface's fit report.
         """
+        from dataclasses import replace
+
+        validate_mode(mode)
         if r is None:
             r = self.rate if isinstance(self.rate, (int, float)) else 0.0
         if enforce_calendar:
-            return calibrate_surface(
+            surface = calibrate_surface(
                 self._panel, model=model, enforce_calendar=True,
-                arbitrage_condition=arbitrage_condition, r=float(r), **model_kwargs,
+                arbitrage_condition=arbitrage_condition, r=float(r),
+                mode=mode, **model_kwargs,
             )
-        return VolSurface.fit(
-            self._panel, model=model,
-            arbitrage_condition=arbitrage_condition, r=float(r), **model_kwargs,
-        )
+        else:
+            surface = VolSurface.fit(
+                self._panel, model=model,
+                arbitrage_condition=arbitrage_condition, r=float(r),
+                mode=mode, **model_kwargs,
+            )
+        if surface.fit_report is not None:
+            surface.fit_report = replace(
+                surface.fit_report,
+                n_rejected_quotes=int(self.rejections["rejected_quotes"]),
+                n_failed_inversions=int(self.rejections["failed_inversions"]),
+                n_skipped_expiries=len(self.rejections["skipped_expiries"]),
+            )
+        return surface

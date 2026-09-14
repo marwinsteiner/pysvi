@@ -4,7 +4,6 @@ High-level calibration pipeline for IV surfaces from option panels.
 Supports SVI, SSVI, eSSVI via models.Parametrization classes.
 """
 
-import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import re
@@ -13,7 +12,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from numpy.typing import NDArray
-from py_lets_be_rational.exceptions import BelowIntrinsicException
+from py_lets_be_rational.exceptions import (AboveMaximumException,
+                                             BelowIntrinsicException)
 from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
@@ -21,7 +21,6 @@ from py_vollib.black_scholes_merton.implied_volatility import (
 from .models import (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
                      Parametrization, ArbitrageFreedom)
 
-warnings.filterwarnings("ignore")
 
 def _rate_at(rate, tte):
     """Resolve a flat float or callable term structure rate(T) on times tte.
@@ -127,7 +126,8 @@ def compute_ivs_vectorized(
                     str(flags[i]).lower(),
                 )
             )
-        except (BelowIntrinsicException, Exception):
+        except (BelowIntrinsicException, AboveMaximumException, ValueError,
+                ZeroDivisionError, OverflowError):
             ivs[i] = np.nan
     return ivs
 

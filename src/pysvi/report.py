@@ -123,6 +123,13 @@ class SurfaceFitReport:
     slices: Tuple[SliceFitReport, ...]
     created_utc: str
     pysvi_version: str
+    #: Ingestion accounting (populated by OptionChain.fit): raw quote
+    #: rows rejected before the panel, mid-quote inversions that failed
+    #: to a NaN implied vol, and expiries dropped whole. Zero when the
+    #: surface was fitted from a prepared panel directly.
+    n_rejected_quotes: int = 0
+    n_failed_inversions: int = 0
+    n_skipped_expiries: int = 0
 
     @property
     def n_ok(self) -> int:
@@ -169,6 +176,13 @@ class SurfaceFitReport:
                 f" {rmse:>10} {mx:>10}  {rng}{flag}"
             )
         cal = "enforced" if self.calendar_enforced else "not enforced"
+        rejected = ""
+        if self.n_rejected_quotes or self.n_failed_inversions or self.n_skipped_expiries:
+            rejected = (
+                f"Ingestion:       {self.n_rejected_quotes} quotes rejected / "
+                f"{self.n_failed_inversions} inversions failed / "
+                f"{self.n_skipped_expiries} expiries skipped\n"
+            )
         header = (
             "SurfaceFitReport\n"
             "================\n"
@@ -177,6 +191,7 @@ class SurfaceFitReport:
             f"Initialization:  {self.initialization:<16} Calendar:  {cal}\n"
             f"Slices:          {self.n_ok} ok / {self.n_failed} failed or rejected\n"
             f"Quotes:          {self.n_quotes} in / {self.n_used} used\n"
+            + rejected +
             "\n"
             f"  {'T':<8} {'status':<18} {'quotes':>6} {'used':>6}"
             f" {'iv RMSE':>10} {'max|res|':>10}  k-range\n"
@@ -186,6 +201,21 @@ class SurfaceFitReport:
 
     def __str__(self) -> str:
         return self.summary()
+
+
+#: Failure-handling modes shared by the ingestion and fit entry points.
+#: strict: the first bad input raises with its location. warn (default):
+#: problems are logged and recorded. lenient: problems are filtered
+#: silently but still recorded -- nothing ever disappears without a count.
+FAILURE_MODES = ("strict", "warn", "lenient")
+
+
+def validate_mode(mode: str) -> str:
+    if mode not in FAILURE_MODES:
+        raise ValueError(
+            f"unknown mode {mode!r}; choose from {FAILURE_MODES}"
+        )
+    return mode
 
 
 def build_surface_report(
