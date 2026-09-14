@@ -19,6 +19,7 @@ from .diagnostics import (check_slice_arbitrage, check_arbitrage,
                           SliceArbitrageReport, ArbitrageReport, LEE_BOUND)
 from .surface import VolSurface, calibrate_surface
 from .report import (SurfaceFitReport, SliceFitReport, SurfaceDiagnostics)
+from .chain import OptionChain
 
 __all__ = [
     "SVI", "NaturalSVI", "SSVI", "ESSVI", "JumpWings", "DirectSVI", "SABR",
@@ -32,5 +33,6 @@ __all__ = [
     "SliceArbitrageReport", "ArbitrageReport", "LEE_BOUND",
     "VolSurface", "calibrate_surface",
     "SurfaceFitReport", "SliceFitReport", "SurfaceDiagnostics",
+    "OptionChain",
     "prepare_slice", "calibrate_slice", "apply_slice", "calculate_implied_forward"
 ]
