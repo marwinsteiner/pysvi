@@ -4,7 +4,6 @@ High-level calibration pipeline for IV surfaces from option panels.
 Supports SVI, SSVI, eSSVI via models.Parametrization classes.
 """
 
-import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import re
@@ -13,7 +12,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from numpy.typing import NDArray
-from py_lets_be_rational.exceptions import BelowIntrinsicException
+from py_lets_be_rational.exceptions import (AboveMaximumException,
+                                             BelowIntrinsicException)
 from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
@@ -21,7 +21,20 @@ from py_vollib.black_scholes_merton.implied_volatility import (
 from .models import (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
                      Parametrization, ArbitrageFreedom)
 
-warnings.filterwarnings("ignore")
+
+def _rate_at(rate, tte):
+    """Resolve a flat float or callable term structure rate(T) on times tte.
+
+    Accepts a float (flat, unchanged behaviour) or a callable T -> rate
+    (continuously compounded zero rate to T). Vectorized over array-like
+    tte for callables.
+    """
+    if callable(rate):
+        arr = np.asarray(tte, dtype=float)
+        flat = np.array([float(rate(t)) for t in np.ravel(arr)])
+        return flat.reshape(arr.shape)
+    return float(rate)
+
 
 _ticker_re = re.compile(r"SPY(\d{6})([CP])(\d+)")
 
@@ -113,7 +126,8 @@ def compute_ivs_vectorized(
                     str(flags[i]).lower(),
                 )
             )
-        except (BelowIntrinsicException, Exception):
+        except (BelowIntrinsicException, AboveMaximumException, ValueError,
+                ZeroDivisionError, OverflowError):
             ivs[i] = np.nan
     return ivs
 
@@ -139,8 +153,9 @@ def calculate_implied_forward(
         Underlying spot price time series.
     tte : pd.Series
         Time-to-expiry (years) for this expiry.
-    r : float
-        Risk-free rate (constant, continuous).
+    r : float or callable
+        Continuously compounded risk-free rate: a flat float, or a
+        callable T -> r(T) for a term structure.
     strike : pd.Series
         Fixed strike (same value across series).
     call_mid : pd.Series
@@ -170,7 +185,8 @@ def calculate_implied_forward(
     1    101.26
     dtype: float64
     """
-    fwd = strike + np.exp(r * tte.astype(float)) * (
+    r_t = _rate_at(r, tte)
+    fwd = strike + np.exp(r_t * tte.astype(float).to_numpy()) * (
         call_mid.astype(float) - put_mid.astype(float)
     )
     mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()

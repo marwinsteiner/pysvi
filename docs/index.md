@@ -11,6 +11,8 @@ Given a panel of contemporaneous European call and put option prices across stri
 - **Full data pipeline**: BSM implied vols from prices, implied forwards from put-call parity, OTM leg selection, slice preparation
 - **Robust calibration**: L-BFGS-B with automatic Nelder-Mead fallback; closed-form fitting for DirectSVI
 - **Optional numba acceleration**: JIT-compiled kernels behind a runtime toggle (`pip install "svi-py[numba]"`), 2-6x faster arbitrage-constrained calibration
+- **Fitted surface object**: `VolSurface.fit(df)` gives evaluation (IVs, ATM level/skew/curvature), arbitrage verification, and Black-76 pricing and Greeks in one object
+- **Calendar-aware surface calibration**: `calibrate_surface` chains the calendar penalty across expiries automatically, fits the eSSVI term structure jointly, and the result interpolates in maturity
 
 ## Installation
 
@@ -25,9 +27,13 @@ Requires Python >= 3.13.
 :caption: Contents
 
 quickstart
+example
+examples
+surface
 models/index
 arbitrage
 calibration
+identifiability
 api
 contributing
 ```

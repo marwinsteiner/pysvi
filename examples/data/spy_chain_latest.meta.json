@@ -1,0 +1,19 @@
+{
+  "underlying": "SPY",
+  "snapshot_utc": "2026-09-14T11:35:45.132056+00:00",
+  "spot": 764.2899780273438,
+  "r_13w_cc": 0.03838382562607969,
+  "r_10y_cc": 0.048552039673688076,
+  "expiries": [
+    "2026-09-22",
+    "2026-09-30",
+    "2026-10-23",
+    "2026-12-18",
+    "2027-02-26",
+    "2027-06-30"
+  ],
+  "moneyness_band": 0.25,
+  "max_stale_days": 3,
+  "quote_source": "last trade (closed book: bid = ask = lastPrice)",
+  "source": "yfinance (delayed Yahoo Finance feed)"
+}
