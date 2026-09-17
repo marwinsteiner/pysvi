@@ -26,16 +26,16 @@ uv run examples/04_calibration_controls.py
 uv run examples/05_surface_pipeline.py
 ```
 
-(Outside this repo: `pip install svi-py yfinance interest-rate-models`
-and run with plain `python`.) A committed sample snapshot in
+(Outside this repo: `pip install svi-py yfinance` and run with plain
+`python`; interest-rate-models comes with svi-py.) A committed sample snapshot in
 `examples/data/` lets 02-05 run immediately; re-run 01 anytime to
 refresh it.
 
-Neither yfinance nor interest-rate-models is a dependency of svi-py:
-the calibration API takes a plain callable `T -> r(T)` and never asks
-where the curve came from. Both packages are used only by script 01,
-which persists the fitted zero curve densely in the snapshot metadata
--- the offline scripts reconstruct r(T) from the file with numpy alone.
+interest-rate-models is a core dependency of svi-py (rate inputs accept
+its curves and models directly); yfinance is examples-only. Script 01
+persists the fitted zero curve densely in the snapshot metadata, and
+the offline scripts rebuild the same `irm.DiscountCurve` from the file
+-- so every run uses only data observable at the snapshot timestamp.
 
 ## No lookahead
 

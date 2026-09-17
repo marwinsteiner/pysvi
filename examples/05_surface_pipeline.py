@@ -26,7 +26,7 @@ OUT = Path(__file__).parent / "data"
 def main() -> None:
     df, meta = load_snapshot()
     spot, r_flat = meta["spot"], meta["r_13w_cc"]
-    r_curve = term_structure(meta)
+    curve = term_structure(meta)             # irm.DiscountCurve
 
     # ── OptionChain: raw quotes in, calibration panel out ────────────
     # Column names are configurable (here the snapshot already uses
@@ -43,7 +43,7 @@ def main() -> None:
         bid="bid",
         ask="ask",
         spot=spot,
-        rate=r_curve,             # term-structure callable
+        rate=curve,               # the irm curve object, directly
         dividend_yield=0.012,     # used only by the spot fallback
     )
     panel = chain.panel           # calibrate_slice schema + iv_bid/iv_ask

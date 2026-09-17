@@ -70,9 +70,11 @@ If you're starting from raw option prices rather than implied vols:
 
 ### Implied forwards
 
-`calculate_implied_forward` estimates the forward price from put-call parity; the rate may be a flat float or a callable term structure $T \mapsto r(T)$:
+`calculate_implied_forward` estimates the forward price from put-call parity:
 
 $$F = K + e^{rT}(C - P)$$
+
+The rate (and every rate input in the library) accepts a flat float, an `interest_rate_models.DiscountCurve`, an interest-rate model from that package (its implied zero curve from today is used), or any callable $T \mapsto r(T)$ such as a cubic spline over curve pillars.
 
 ### OTM leg selection
 

@@ -107,4 +107,14 @@ $$F = K + e^{rT}(C - P)$$
 
 - `choose_leg` selects the OTM leg (calls for $K \geq F$, puts for $K < F$) for cleaner vol quotes.
 
+Wherever a rate enters (implied forwards, `OptionChain` IV inversion), you can express your view of interest rates in any of four forms: a flat float; a fitted market curve as an [`interest_rate_models.DiscountCurve`](https://interest-rate-models.readthedocs.io) (interest-rate-models is a core dependency); an interest-rate model from the same package (Vasicek, Hull-White, ... -- its implied zero curve from today is used); or any callable $T \mapsto r(T)$, such as a `scipy.interpolate.CubicSpline` over your own curve pillars.
+
+```python
+import interest_rate_models as irm
+
+curve = irm.DiscountCurve.from_zero_rates(times, zero_rates)
+chain = OptionChain.from_dataframe(df, rate=curve)             # fitted curve
+chain = OptionChain.from_dataframe(df, rate=CubicSpline(t, r)) # custom spline
+```
+
 You need a panel of **contemporaneous call and put option prices** across multiple strikes for at least one maturity. The richer the strike grid, the better the calibration. See {doc}`calibration` for pipeline details, and {doc}`examples` for runnable scripts that build such a panel from real Yahoo Finance data without lookahead.
