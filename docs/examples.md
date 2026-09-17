@@ -10,7 +10,7 @@ of the library surface.
 
 | Script | Covers |
 |---|---|
-| [`01_fetch_chain_yfinance.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/01_fetch_chain_yfinance.py) | Snapshot discipline: a contemporaneous chain + rates with **no lookahead**; `parse_ticker_info` |
+| [`01_fetch_chain_yfinance.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/01_fetch_chain_yfinance.py) | Snapshot discipline: a contemporaneous chain with **no lookahead**; a four-pillar Treasury curve fitted with [interest-rate-models](https://pypi.org/project/interest-rate-models/); `parse_ticker_info` |
 | [`02_implied_vol_and_forwards.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/02_implied_vol_and_forwards.py) | `calculate_implied_forward` (flat and term-structure rates), `choose_leg`, `compute_ivs_vectorized`, `prepare_slice`; implied-vol inversion methods with sources |
 | [`03_single_slice_models.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/03_single_slice_models.py) | All seven parametrizations, `apply_slice`, the module-level total-variance functions, the raw/natural bijection, derivatives/density/wing slopes, `check_slice_arbitrage` |
 | [`04_calibration_controls.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/04_calibration_controls.py) | Every `objective`, `loss`, `f_scale`, `initialization`; `ArbitrageFreedom` flags; the numba toggles |
@@ -20,9 +20,18 @@ Only script 01 needs the network; a committed sample snapshot lets
 02–05 run immediately:
 
 ```bash
-uv run --with yfinance examples/01_fetch_chain_yfinance.py   # optional refresh
+uv run --with yfinance --with interest-rate-models     examples/01_fetch_chain_yfinance.py                      # optional refresh
 uv run examples/02_implied_vol_and_forwards.py               # ... through 05
 ```
+
+Rates are a real curve, not a constant: script 01 fits a four-pillar
+Treasury zero curve (13w/5y/10y/30y) with
+[interest-rate-models](https://pypi.org/project/interest-rate-models/)
+(`import interest_rate_models as irm`; `irm.DiscountCurve`) and
+persists it densely in the snapshot metadata. Neither yfinance nor
+interest-rate-models is a dependency of `svi-py` -- the calibration
+API takes a plain callable `T -> r(T)`, and the offline scripts
+reconstruct it from the file with numpy alone.
 
 ## No lookahead
 

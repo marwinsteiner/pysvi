@@ -37,11 +37,16 @@ def load_snapshot(name: str = "spy_chain_latest"):
 
 
 def term_structure(meta):
-    """Continuously compounded zero rate r(T) from the two snapshot tenors.
+    """Continuously compounded zero rate r(T) from the snapshot's curve.
 
-    Linear interpolation between the 13-week and 10-year points, flat
-    beyond -- a toy curve, but built entirely from snapshot-time data.
+    Script 01 fits a real four-pillar Treasury curve (13w/5y/10y/30y)
+    with the interest-rate-models package (log-linear discount-factor
+    interpolation via ``irm.DiscountCurve``) and persists it densely in
+    the metadata, so this reconstruction needs neither the network nor
+    the extra dependency -- and, like everything else, uses only data
+    observable at the snapshot timestamp.
     """
-    tenors = np.array([0.25, 10.0])
-    rates = np.array([meta["r_13w_cc"], meta["r_10y_cc"]])
-    return lambda T: float(np.interp(T, tenors, rates))
+    zc = meta["zero_curve"]
+    times = np.asarray(zc["times"], dtype=float)
+    rates = np.asarray(zc["rates"], dtype=float)
+    return lambda T: float(np.interp(T, times, rates))

@@ -59,6 +59,11 @@ def main() -> None:
         params = model.calibrate(
             k, w, objective=objective, T=T, initialization="multi_start",
         )
+        if params is None:
+            # Real data does this: a residual space can drive the fit
+            # to a parameter bound and fail the validity checks.
+            print(f"objective={objective:<15} calibration failed (None)")
+            continue
         print(f"objective={objective:<15} IV RMSE "
               f"{rmse_iv(model, params, k, w, T) * 1e4:6.1f} bp")
 
