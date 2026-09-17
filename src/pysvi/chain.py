@@ -28,7 +28,11 @@ from .models import ArbitrageFreedom, Parametrization
 from .report import validate_mode
 from .surface import VolSurface, calibrate_surface
 
-RateLike = Union[float, "callable"]
+#: A rate view in any accepted form: flat float, an
+#: interest_rate_models.DiscountCurve, an interest-rate model from
+#: interest_rate_models (Vasicek, Hull-White, ...), or any callable
+#: T -> r(T) such as a scipy CubicSpline over curve pillars.
+RateLike = Union[float, "callable", object]
 
 
 def _invert_iv(price, F, K, r, T, flag) -> float:
@@ -104,9 +108,13 @@ class OptionChain:
             'c'/'call'/'p'/'put' (case-insensitive).
         spot : float, optional
             Underlying spot, used only for the forward fallback.
-        rate : float or callable, default 0.0
-            Continuously compounded rate: flat float or T -> r(T).
-        dividend_yield : float or callable, default 0.0
+        rate : float, curve, model, or callable, default 0.0
+            Continuously compounded zero rates: a flat float, an
+            ``interest_rate_models.DiscountCurve``, an interest-rate
+            model from ``interest_rate_models`` (its implied zero curve
+            from today is used), or any callable T -> r(T) -- e.g. a
+            ``scipy.interpolate.CubicSpline`` over curve pillars.
+        dividend_yield : float, curve, model, or callable, default 0.0
             Continuous dividend yield for the forward fallback only
             (put-call-parity forwards embed dividends already).
         mode : str, default "warn"

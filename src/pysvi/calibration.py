@@ -23,12 +23,32 @@ from .models import (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
 
 
 def _rate_at(rate, tte):
-    """Resolve a flat float or callable term structure rate(T) on times tte.
+    """Resolve a rate specification to zero rates r(T) on times tte.
 
-    Accepts a float (flat, unchanged behaviour) or a callable T -> rate
-    (continuously compounded zero rate to T). Vectorized over array-like
-    tte for callables.
+    Every rate input in the library goes through here, so users can
+    express a view of interest rates in whichever form fits:
+
+    * a float -- flat continuously compounded rate (unchanged behaviour);
+    * an ``interest_rate_models.DiscountCurve`` (or any object with
+      vectorized ``zero_rate(t)`` and ``discount(t)``) -- a fitted
+      market curve;
+    * an interest-rate model from ``interest_rate_models`` (any object
+      with ``bond_price``/``zero_rate(t, T)``) -- the model's implied
+      zero curve from today, ``zero_rate(0, T)``;
+    * any callable T -> r(T) -- e.g. a ``scipy.interpolate.CubicSpline``
+      over curve pillars, or a lambda.
+
+    Vectorized over array-like tte in all cases.
     """
+    if hasattr(rate, "zero_rate"):
+        arr = np.asarray(tte, dtype=float)
+        if hasattr(rate, "discount"):
+            # DiscountCurve-like: vectorized one-argument zero_rate(t)
+            flat = np.asarray(rate.zero_rate(arr), dtype=float)
+            return flat.reshape(arr.shape)
+        # interest-rate model: zero rate from today to each maturity
+        flat = np.array([float(rate.zero_rate(0.0, t)) for t in np.ravel(arr)])
+        return flat.reshape(arr.shape)
     if callable(rate):
         arr = np.asarray(tte, dtype=float)
         flat = np.array([float(rate(t)) for t in np.ravel(arr)])
@@ -153,9 +173,10 @@ def calculate_implied_forward(
         Underlying spot price time series.
     tte : pd.Series
         Time-to-expiry (years) for this expiry.
-    r : float or callable
-        Continuously compounded risk-free rate: a flat float, or a
-        callable T -> r(T) for a term structure.
+    r : float, curve, model, or callable
+        Continuously compounded risk-free rate in any form _rate_at
+        accepts: flat float, ``interest_rate_models.DiscountCurve``,
+        an interest-rate model, or a callable T -> r(T).
     strike : pd.Series
         Fixed strike (same value across series).
     call_mid : pd.Series
