@@ -625,15 +625,20 @@ def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
                 objective, res.x, method="L-BFGS-B", bounds=bounds,
                 options={},
             )
-        # Accept the settled endpoint regardless of the success flag:
-        # scipy's ABNORMAL status fires whenever the line search stalls
-        # below the achievable precision -- which on noisy objectives
-        # (fastmath kernels) happens even at default tolerances, at
-        # perfectly good minima. A point where two successive L-BFGS-B
-        # runs stopped improving is settled; the status is not an
-        # oracle, the objective value is.
+        # In multi-start mode, accept the settled endpoint regardless
+        # of the success flag: scipy's ABNORMAL status fires whenever
+        # the line search stalls below the achievable precision --
+        # which on noisy (fastmath) objectives happens even at default
+        # tolerances, at perfectly good minima -- and requiring success
+        # would leave only the trivially-converged degenerate fits in
+        # the race. With many candidates competing by objective value,
+        # the value is the oracle, not the status flag. The
+        # single-start path keeps the stricter legacy semantics
+        # (converged result, else the Nelder-Mead fallback): with no
+        # competition, the flag is the only convergence evidence.
+        accept = res.success or len(starts) > 1
         if (
-            np.isfinite(res.fun) and np.all(np.isfinite(res.x))
+            accept and np.isfinite(res.fun) and np.all(np.isfinite(res.x))
             and (validity is None or validity(res.x))
             and (best is None or res.fun < best.fun)
         ):
