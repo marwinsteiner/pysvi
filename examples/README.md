@@ -8,7 +8,7 @@ documentation of the library surface.
 
 | Script | What it covers |
 |---|---|
-| `01_fetch_chain_yfinance.py` | Snapshot discipline: fetching a contemporaneous chain + rates **without lookahead**; `parse_ticker_info` |
+| `01_fetch_chain_yfinance.py` | Snapshot discipline: fetching a contemporaneous chain **without lookahead**; a real four-pillar Treasury curve (13w/5y/10y/30y) fitted with [interest-rate-models](https://pypi.org/project/interest-rate-models/) (`irm.DiscountCurve`, plus a Vasicek fit); `parse_ticker_info` |
 | `02_implied_vol_and_forwards.py` | `calculate_implied_forward` (flat + term-structure rates), `choose_leg`, `compute_ivs_vectorized`, `prepare_slice`; implied-vol inversion methods (Black-76, LBR, Volfi) with sources |
 | `03_single_slice_models.py` | All 7 parametrizations via `get_model`/`calibrate_slice`/`apply_slice`, the module-level `*_total_variance` functions, `natural_to_raw`/`raw_to_natural`, `derivatives`/`dw_dk`/`d2w_dk2`/`density`/`wing_slopes`/`fd_step`, `check_slice_arbitrage` |
 | `04_calibration_controls.py` | Every `objective` (incl. `bid_ask`), every `loss`, `f_scale`, every `initialization`, `ArbitrageFreedom` flags, `use_numba`/`numba_available`/`PYSVI_NUMBA` |
@@ -19,16 +19,23 @@ documentation of the library surface.
 Only script 01 needs the network (and the `yfinance` extra):
 
 ```bash
-uv run --with yfinance examples/01_fetch_chain_yfinance.py   # fetch snapshot
+uv run --with yfinance --with interest-rate-models examples/01_fetch_chain_yfinance.py   # fetch snapshot
 uv run examples/02_implied_vol_and_forwards.py
 uv run examples/03_single_slice_models.py
 uv run examples/04_calibration_controls.py
 uv run examples/05_surface_pipeline.py
 ```
 
-(Outside this repo: `pip install svi-py yfinance` and run with plain
-`python`.) A committed sample snapshot in `examples/data/` lets 02-05
-run immediately; re-run 01 anytime to refresh it.
+(Outside this repo: `pip install svi-py yfinance interest-rate-models`
+and run with plain `python`.) A committed sample snapshot in
+`examples/data/` lets 02-05 run immediately; re-run 01 anytime to
+refresh it.
+
+Neither yfinance nor interest-rate-models is a dependency of svi-py:
+the calibration API takes a plain callable `T -> r(T)` and never asks
+where the curve came from. Both packages are used only by script 01,
+which persists the fitted zero curve densely in the snapshot metadata
+-- the offline scripts reconstruct r(T) from the file with numpy alone.
 
 ## No lookahead
 

@@ -29,7 +29,7 @@ knowable at fetch time, which is exactly what a backtest would have had.
 
 Usage::
 
-    uv run --with yfinance examples/01_fetch_chain_yfinance.py
+    uv run --with yfinance --with interest-rate-models examples/01_fetch_chain_yfinance.py
 
 Outputs ``examples/data/spy_chain_<UTCstamp>.csv`` (raw quotes) plus a
 ``.meta.json`` sidecar (snapshot timestamp, spot, rates), and refreshes
@@ -41,6 +41,8 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+import interest_rate_models as irm
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -70,11 +72,33 @@ def main() -> None:
     ticker = yf.Ticker(UNDERLYING)
     spot = float(ticker.fast_info.last_price)
 
-    # ^IRX = 13-week T-bill, ^TNX = 10-year note (both annualized %).
-    # Two points are enough to demonstrate a term structure; a real
-    # desk would bootstrap a proper curve, still AT the snapshot time.
-    r_13w = annual_to_continuous(float(yf.Ticker("^IRX").fast_info.last_price))
-    r_10y = annual_to_continuous(float(yf.Ticker("^TNX").fast_info.last_price))
+    # Treasury pillars, all at the snapshot: ^IRX = 13-week bill,
+    # ^FVX = 5y, ^TNX = 10y, ^TYX = 30y (annualized %). The curve
+    # between and beyond the pillars is fitted below with the
+    # interest-rate-models package (PyPI: interest-rate-models) --
+    # log-linear discount-factor interpolation via DiscountCurve --
+    # and persisted densely so the offline examples need neither the
+    # network nor the extra dependency.
+    tenors = {"^IRX": 0.25, "^FVX": 5.0, "^TNX": 10.0, "^TYX": 30.0}
+    pillar_times = np.array(sorted(tenors.values()))
+    pillar_rates = np.array([
+        annual_to_continuous(float(yf.Ticker(sym).fast_info.last_price))
+        for sym, _ in sorted(tenors.items(), key=lambda kv: kv[1])
+    ])
+
+    curve = irm.DiscountCurve.from_zero_rates(pillar_times, pillar_rates)
+    r_13w = float(curve.zero_rate(0.25))
+    # Dense fitted zero curve for the offline scripts (no irm needed
+    # downstream: term_structure() in _snapshot.py just interpolates it).
+    grid_times = np.geomspace(0.02, 30.0, 60)
+    grid_rates = np.array([float(curve.zero_rate(t)) for t in grid_times])
+
+    # The same curve also feeds interest-rate-models' model layer --
+    # e.g. a Vasicek equilibrium fit to today's pillars:
+    vasicek = irm.get_model("vasicek", kappa=0.5, theta=0.04, sigma=0.01)
+    vas = vasicek.calibrate(curve, r0=r_13w)
+    print("Vasicek fit to today's curve: "
+          + ", ".join(f"{kk}={vv:.4f}" for kk, vv in vas.items()))
 
     all_expiries = ticker.options
     if not all_expiries:
@@ -160,7 +184,11 @@ def main() -> None:
         "snapshot_utc": snapshot_ts.isoformat(),
         "spot": spot,
         "r_13w_cc": r_13w,
-        "r_10y_cc": r_10y,
+        "curve_pillars": {str(t): float(r)
+                          for t, r in zip(pillar_times, pillar_rates)},
+        "zero_curve": {"times": grid_times.tolist(),
+                       "rates": grid_rates.tolist(),
+                       "fitted_with": "interest-rate-models DiscountCurve"},
         "expiries": expiries,
         "moneyness_band": MONEYNESS_BAND,
         "max_stale_days": MAX_STALE_DAYS,
@@ -171,7 +199,9 @@ def main() -> None:
     shutil.copy(csv_path, DATA_DIR / "spy_chain_latest.csv")
     shutil.copy(meta_path, DATA_DIR / "spy_chain_latest.meta.json")
 
-    print(f"spot={spot:.2f}  r_13w={r_13w:.4%}  r_10y={r_10y:.4%}")
+    print(f"spot={spot:.2f}  zero curve: "
+          + "  ".join(f"{tt:g}y={rr:.3%}" for tt, rr in
+                      zip(pillar_times, pillar_rates)))
     print(f"wrote {csv_path.name} ({len(df)} quotes, {len(expiries)} expiries)")
     print("downstream examples read spy_chain_latest.csv -- no further network access")
 
