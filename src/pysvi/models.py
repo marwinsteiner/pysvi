@@ -574,7 +574,8 @@ def _baseline_options(init, mode, loss_code):
 
 
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
-                          nm_options=None, baseline_options=None):
+                          nm_options=None, baseline_options=None,
+                          validity=None):
     """L-BFGS-B from each start, keeping the best converged endpoint.
 
     A run that does not converge is polished: restarted from its stall
@@ -595,28 +596,45 @@ def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
     single-start path would use, so the multi-start result can never be
     worse than the default path it replaces.
 
+    ``validity`` (a predicate on the parameter vector) filters
+    candidates DURING selection: a run whose endpoint violates the
+    model's validity conditions (a parameter pinned at an excluded
+    bound, say |rho| >= 0.999) is skipped so the best VALID candidate
+    wins, instead of an invalid winner vetoing the whole fit in the
+    caller's post-fit check while valid runners-up are thrown away.
+
     Falls back to Nelder-Mead from the first start when no run yields a
-    converged endpoint. Returns the scipy result, or None on total
+    finite, valid endpoint. Returns the scipy result, or None on total
     failure.
     """
     from scipy.optimize import minimize
 
-    polish_options = baseline_options or {}
-    runs = [(x0, lbfgs_options or {}, True) for x0 in starts]
+    runs = [(x0, lbfgs_options or {}) for x0 in starts]
     if baseline_options is not None:
-        runs.append((starts[0], baseline_options, False))
+        runs.append((starts[0], baseline_options))
     best = None
-    for x0, opts, may_polish in runs:
+    for x0, opts in runs:
         res = minimize(
             objective, x0, method="L-BFGS-B", bounds=bounds, options=opts,
         )
-        if not res.success and may_polish and np.all(np.isfinite(res.x)):
+        if not res.success and np.all(np.isfinite(res.x)):
+            # Polish under scipy's DEFAULT tolerances: the stall means
+            # the run's own (tight) tolerances are below the achievable
+            # precision, so re-running with them would stall again.
             res = minimize(
                 objective, res.x, method="L-BFGS-B", bounds=bounds,
-                options=polish_options,
+                options={},
             )
+        # Accept the settled endpoint regardless of the success flag:
+        # scipy's ABNORMAL status fires whenever the line search stalls
+        # below the achievable precision -- which on noisy objectives
+        # (fastmath kernels) happens even at default tolerances, at
+        # perfectly good minima. A point where two successive L-BFGS-B
+        # runs stopped improving is settled; the status is not an
+        # oracle, the objective value is.
         if (
-            res.success and np.isfinite(res.fun) and np.all(np.isfinite(res.x))
+            np.isfinite(res.fun) and np.all(np.isfinite(res.x))
+            and (validity is None or validity(res.x))
             and (best is None or res.fun < best.fun)
         ):
             best = res
@@ -626,7 +644,9 @@ def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
         objective, starts[0], method="Nelder-Mead",
         options=nm_options if nm_options is not None else {},
     )
-    return res if res.success else None
+    if res.success and (validity is None or validity(res.x)):
+        return res
+    return None
 
 
 class Parametrization(ABC):
@@ -892,6 +912,7 @@ class SVI(Parametrization):
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             nm_options={"maxiter": 2000},
             baseline_options=_baseline_options(init, mode, loss_code),
+            validity=lambda x: x[1] > 0 and x[4] > 0 and abs(x[2]) < 0.999,
         )
         if res is None:
             return None
@@ -1034,6 +1055,7 @@ class NaturalSVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
             nm_options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+            validity=lambda x: x[3] > 0 and x[4] > 0 and abs(x[2]) < 0.999,
         )
         if res is None:
             return None
@@ -1147,6 +1169,7 @@ class SSVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             baseline_options=_baseline_options(init, mode, loss_code),
+            validity=lambda x: x[1] > 0 and abs(x[0]) < 0.999,
         )
         if res is None:
             return None
@@ -1259,6 +1282,7 @@ class ESSVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             baseline_options=_baseline_options(init, mode, loss_code),
+            validity=lambda x: x[3] > 0,
         )
         if res is None:
             return None
@@ -1413,6 +1437,8 @@ class JumpWings(Parametrization):
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             nm_options={"maxiter": 2000},
             baseline_options=_baseline_options(init, mode, loss_code),
+            validity=lambda x: (x[0] > 0 and x[4] > 0
+                                and x[2] >= 0 and x[3] >= 0),
         )
         if res is None:
             return None
@@ -1734,6 +1760,7 @@ class SABR(Parametrization):
             objective, starts, bounds,
             lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
             nm_options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+            validity=lambda x: x[0] > 0 and abs(x[1]) < 0.999 and x[2] >= 0,
         )
         if res is None:
             return None
