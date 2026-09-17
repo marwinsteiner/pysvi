@@ -565,7 +565,7 @@ def _baseline_options(init, mode, loss_code):
 
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
                           nm_options=None, baseline_options=None,
-                          validity=None):
+                          validity=None, rank_objective=None):
     """L-BFGS-B from each start, keeping the best converged endpoint.
 
     A run that does not converge is polished: restarted from its stall
@@ -602,7 +602,7 @@ def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
     runs = [(x0, lbfgs_options or {}) for x0 in starts]
     if baseline_options is not None:
         runs.append((starts[0], baseline_options))
-    best = None
+    best, best_score = None, np.inf
     for x0, opts in runs:
         res = minimize(
             objective, x0, method="L-BFGS-B", bounds=bounds, options=opts,
@@ -630,9 +630,14 @@ def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
         if (
             accept and np.isfinite(res.fun) and np.all(np.isfinite(res.x))
             and (validity is None or validity(res.x))
-            and (best is None or res.fun < best.fun)
         ):
-            best = res
+            # Candidates are ranked by ``rank_objective`` when given (a
+            # platform-stable evaluation of the same objective); the
+            # values the optimizer itself reported are fastmath-noisy
+            # and can order near-tied basins differently per CPU.
+            score = float(rank_objective(res.x)) if rank_objective else res.fun
+            if np.isfinite(score) and (best is None or score < best_score):
+                best, best_score = res, score
     if best is not None:
         return best
     res = minimize(
@@ -868,12 +873,20 @@ class SVI(Parametrization):
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("svi_obj")
 
-        def objective(params):
-            return core(
+        def objective(params, _core=core):
+            return _core(
                 np.asarray(params, dtype=np.float64), k, w_target,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
+
+        def rank_objective(params):
+            # Rank multi-start candidates on the plain NumPy kernel:
+            # fastmath reorders floating-point ops per CPU, and at
+            # near-tied basins that platform noise decides the winner.
+            # The plain evaluation gives every platform the same
+            # ranking (the optimization itself stays on fast kernels).
+            return objective(params, _core=_kernels._PLAIN["svi_obj"])
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -907,6 +920,7 @@ class SVI(Parametrization):
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             nm_options={"maxiter": 2000},
             baseline_options=_baseline_options(init, mode, loss_code),
+            rank_objective=rank_objective,
             validity=lambda x: x[1] > 0 and x[4] > 0 and abs(x[2]) < 0.999,
         )
         if res is None:
@@ -999,12 +1013,20 @@ class NaturalSVI(Parametrization):
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("natural_obj")
 
-        def objective(params):
-            return core(
+        def objective(params, _core=core):
+            return _core(
                 np.asarray(params, dtype=np.float64), k, w_target,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
+
+        def rank_objective(params):
+            # Rank multi-start candidates on the plain NumPy kernel:
+            # fastmath reorders floating-point ops per CPU, and at
+            # near-tied basins that platform noise decides the winner.
+            # The plain evaluation gives every platform the same
+            # ranking (the optimization itself stays on fast kernels).
+            return objective(params, _core=_kernels._PLAIN["natural_obj"])
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1050,6 +1072,7 @@ class NaturalSVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
             nm_options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+            rank_objective=rank_objective,
             validity=lambda x: x[3] > 0 and x[4] > 0 and abs(x[2]) < 0.999,
         )
         if res is None:
@@ -1140,12 +1163,20 @@ class SSVI(Parametrization):
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("ssvi_obj")
 
-        def objective(params):
-            return core(
+        def objective(params, _core=core):
+            return _core(
                 np.asarray(params, dtype=np.float64), k, w_target, theta,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
+
+        def rank_objective(params):
+            # Rank multi-start candidates on the plain NumPy kernel:
+            # fastmath reorders floating-point ops per CPU, and at
+            # near-tied basins that platform noise decides the winner.
+            # The plain evaluation gives every platform the same
+            # ranking (the optimization itself stays on fast kernels).
+            return objective(params, _core=_kernels._PLAIN["ssvi_obj"])
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, 1.0])
@@ -1164,6 +1195,7 @@ class SSVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             baseline_options=_baseline_options(init, mode, loss_code),
+            rank_objective=rank_objective,
             validity=lambda x: x[1] > 0 and abs(x[0]) < 0.999,
         )
         if res is None:
@@ -1252,12 +1284,20 @@ class ESSVI(Parametrization):
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("essvi_obj")
 
-        def objective(params):
-            return core(
+        def objective(params, _core=core):
+            return _core(
                 np.asarray(params, dtype=np.float64), k, w_target, theta, theta_ref,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
+
+        def rank_objective(params):
+            # Rank multi-start candidates on the plain NumPy kernel:
+            # fastmath reorders floating-point ops per CPU, and at
+            # near-tied basins that platform noise decides the winner.
+            # The plain evaluation gives every platform the same
+            # ranking (the optimization itself stays on fast kernels).
+            return objective(params, _core=_kernels._PLAIN["essvi_obj"])
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
@@ -1277,6 +1317,7 @@ class ESSVI(Parametrization):
             objective, starts, bounds,
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             baseline_options=_baseline_options(init, mode, loss_code),
+            rank_objective=rank_objective,
             validity=lambda x: x[3] > 0,
         )
         if res is None:
@@ -1394,12 +1435,20 @@ class JumpWings(Parametrization):
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("jw_obj")
 
-        def objective(params):
-            return core(
+        def objective(params, _core=core):
+            return _core(
                 np.asarray(params, dtype=np.float64), k, w_target, T,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
+
+        def rank_objective(params):
+            # Rank multi-start candidates on the plain NumPy kernel:
+            # fastmath reorders floating-point ops per CPU, and at
+            # near-tied basins that platform noise decides the winner.
+            # The plain evaluation gives every platform the same
+            # ranking (the optimization itself stays on fast kernels).
+            return objective(params, _core=_kernels._PLAIN["jw_obj"])
 
         init = _initialization(kwargs)
         # Initial guess from market data
@@ -1432,6 +1481,7 @@ class JumpWings(Parametrization):
             lbfgs_options=_tight_if_controls(init, mode, loss_code),
             nm_options={"maxiter": 2000},
             baseline_options=_baseline_options(init, mode, loss_code),
+            rank_objective=rank_objective,
             validity=lambda x: (x[0] > 0 and x[4] > 0
                                 and x[2] >= 0 and x[3] >= 0),
         )
@@ -1720,12 +1770,20 @@ class SABR(Parametrization):
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(k, w_target, kwargs)
         core = _kernels.resolve("sabr_obj")
 
-        def objective(params):
-            return core(
+        def objective(params, _core=core):
+            return _core(
                 np.asarray(params, dtype=np.float64), k, w_target, beta, F, T,
                 k_grid, w_prev_arr, check_butterfly, check_calendar, has_prev,
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
+
+        def rank_objective(params):
+            # Rank multi-start candidates on the plain NumPy kernel:
+            # fastmath reorders floating-point ops per CPU, and at
+            # near-tied basins that platform noise decides the winner.
+            # The plain evaluation gives every platform the same
+            # ranking (the optimization itself stays on fast kernels).
+            return objective(params, _core=_kernels._PLAIN["sabr_obj"])
 
         init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
@@ -1755,6 +1813,7 @@ class SABR(Parametrization):
             objective, starts, bounds,
             lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
             nm_options={"maxiter": 2000, "fatol": 1e-14, "xatol": 1e-10},
+            rank_objective=rank_objective,
             validity=lambda x: x[0] > 0 and abs(x[1]) < 0.999 and x[2] >= 0,
         )
         if res is None:
