@@ -36,8 +36,8 @@ from scipy.special import ndtr
 from . import _kernels
 from .models import (
     ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, Parametrization, SABR, SSVI,
-    _initialization, _minimize_with_starts, _multistart_variants, _penalty_grid,
-    _prepare_loss_inputs, essvi_total_variance,
+    _initialization, _mad_scale, _minimize_with_starts, _multistart_variants,
+    _penalty_grid, _prepare_loss_inputs, essvi_total_variance,
 )
 from .calibration import calibrate_slice, get_model, prepare_slice
 from .diagnostics import ArbitrageReport, check_arbitrage
@@ -744,40 +744,82 @@ def _calibrate_essvi_global(
         )
         ctx.append((T, k_i, w_i, F_i, theta_by_T[T], mode, loss_code, weights))
     # one common grid spanning all slices, for butterfly and calendar
-    k_lo = min(float(item[1].min()) for item in ctx)
-    k_hi = max(float(item[1].max()) for item in ctx)
-    common_grid = np.linspace(k_lo - 0.5, k_hi + 0.5, 200)
+    # (the same grid policy as every per-slice penalty: _penalty_grid)
+    common_grid = _penalty_grid(np.concatenate([item[1] for item in ctx]))
     empty = np.empty(0)
 
-    f_scale = float(model_kwargs.get("f_scale", 1.0))
     core = _kernels.resolve("essvi_obj")
     theta_ref = float(theta_ref)
 
-    def objective(p):
-        p = np.asarray(p, dtype=np.float64)
-        total = 0.0
-        w_prev = empty
-        has_prev = False
-        for T, k_i, w_i, F_i, theta_i, mode, loss_code, weights in ctx:
-            total += core(
-                p, k_i, w_i, theta_i, theta_ref, common_grid, w_prev,
-                check_bf, enforce_calendar, has_prev,
-                mode, weights, empty, empty, loss_code, f_scale,
-            )
-            if enforce_calendar:
-                rho_t = ESSVI._rho_of(theta_i, theta_ref, p[0], p[1], p[2])
-                phi = p[3] / np.sqrt(theta_i)
-                w_prev = essvi_total_variance(common_grid, theta_i, rho_t, phi)
-                has_prev = True
-        return total
+    def make_objective(kernel, loss_override=None, f_scale_val=1.0):
+        def objective(p):
+            p = np.asarray(p, dtype=np.float64)
+            total = 0.0
+            w_prev = empty
+            has_prev = False
+            for T, k_i, w_i, F_i, theta_i, mode, loss_code, weights in ctx:
+                lc = loss_code if loss_override is None else loss_override
+                total += kernel(
+                    p, k_i, w_i, theta_i, theta_ref, common_grid, w_prev,
+                    check_bf, enforce_calendar, has_prev,
+                    mode, weights, empty, empty, lc, f_scale_val,
+                )
+                if enforce_calendar:
+                    rho_t = ESSVI._rho_of(theta_i, theta_ref, p[0], p[1], p[2])
+                    phi = p[3] / np.sqrt(theta_i)
+                    w_prev = essvi_total_variance(common_grid, theta_i, rho_t, phi)
+                    has_prev = True
+            return total
+        return objective
 
     x0 = np.array([0.0, -0.5, 0.5, 1.0])
     bounds = [(-0.999, 0.999), (-2.0, 2.0), (-2.0, 2.0), (1e-8, None)]
+    validity = lambda x: x[3] > 0
+    tight = {"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000}
+
+    # Robust-loss scale: same policy as every per-slice path
+    # (_resolve_f_scale) -- explicit kwarg wins; l2 needs none; else
+    # 1.4826 * MAD of the joint mode-space residuals at a pilot l2 fit.
+    f_scale = model_kwargs.get("f_scale")
+    is_l2 = all(item[6] == 0 for item in ctx)
+    if f_scale is not None:
+        f_scale = float(f_scale)
+    elif is_l2:
+        f_scale = 1.0
+    else:
+        pilot = _minimize_with_starts(
+            make_objective(core, loss_override=0, f_scale_val=1.0),
+            [x0], bounds, lbfgs_options=tight, nm_options={"maxiter": 2000},
+            validity=validity,
+        )
+        if pilot is not None:
+            rho0_p, rho1_p, alpha_p, eta_p = pilot.x
+            resid_k, resid_wm, resid_wt, resid_wgt = [], [], [], []
+            for T, k_i, w_i, F_i, theta_i, mode, loss_code, weights in ctx:
+                rho_t = ESSVI._rho_of(theta_i, theta_ref, rho0_p, rho1_p, alpha_p)
+                resid_k.append(k_i)
+                resid_wm.append(essvi_total_variance(
+                    k_i, theta_i, rho_t, eta_p / np.sqrt(theta_i)))
+                resid_wt.append(w_i)
+                resid_wgt.append(weights)
+            all_wgt = np.concatenate(resid_wgt) if resid_wgt[0].size else empty
+            f_scale = _mad_scale(
+                np.concatenate(resid_k), np.concatenate(resid_wm),
+                np.concatenate(resid_wt), ctx[0][5], all_wgt, empty, empty,
+            )
+        else:
+            f_scale = 1.0
+
+    objective = make_objective(core, f_scale_val=f_scale)
     starts = _multistart_variants(x0, 0, 3) if init == "multi_start" else [x0]
     res = _minimize_with_starts(
         objective, starts, bounds,
-        lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+        lbfgs_options=tight,
         nm_options={"maxiter": 2000},
+        validity=validity,
+        rank_objective=make_objective(
+            _kernels._PLAIN["essvi_obj"], f_scale_val=f_scale
+        ),
     )
     if res is None:
         raise ValueError("calibrate_surface: joint eSSVI fit failed to converge")
