@@ -67,6 +67,23 @@ def test_unknown_objective_and_loss_raise():
         SVI().calibrate(_K_GRID, _W_TRUE, objective="bid_ask")
 
 
+def test_crossed_bid_ask_band_rejected():
+    """A crossed band (w_bid > w_ask) raises instead of silently fitting
+    toward an impossible band -- the usual cause is swapped kwargs."""
+    with pytest.raises(ValueError, match="crossed band"):
+        SVI().calibrate(
+            _K_GRID, _W_TRUE, objective="bid_ask",
+            w_bid=_W_TRUE + 5e-4, w_ask=_W_TRUE - 5e-4,  # swapped
+        )
+    # a single crossed quote is enough
+    w_bid = _W_TRUE - 5e-4
+    w_ask = _W_TRUE + 5e-4
+    w_bid_bad = w_bid.copy(); w_bid_bad[3] = w_ask[3] + 1e-6
+    with pytest.raises(ValueError, match="1 quote"):
+        SVI().calibrate(_K_GRID, _W_TRUE, objective="bid_ask",
+                        w_bid=w_bid_bad, w_ask=w_ask)
+
+
 # ── Robust losses ────────────────────────────────────────────────────
 
 def test_robust_loss_resists_corrupted_wing():
