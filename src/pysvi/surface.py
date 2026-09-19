@@ -56,6 +56,23 @@ def _shape_like(values, original):
     return float(values[0]) if np.ndim(original) == 0 else values
 
 
+def _atm_theta(g) -> float:
+    """ATM total variance of a slice: w interpolated at k = 0.
+
+    SSVI fixes w(0) = theta exactly, so theta must be the ATM level --
+    the smile MINIMUM sits away from k = 0 on any skewed smile and
+    systematically understates the ATM vol, which the (rho, eta) fit
+    can never correct. Reads the cleaned inputs (prepare_slice) so a
+    junk quote cannot drive theta toward zero; falls back to the raw
+    minimum only for slices too thin to clean.
+    """
+    k, w, _ = prepare_slice(g)
+    if k is None:
+        return float(np.nanmin(g["iv"] ** 2 * g["maturity"]))
+    order = np.argsort(k)
+    return float(np.interp(0.0, k[order], w[order]))
+
+
 class VolSurface:
     """A fitted implied-volatility surface across maturities.
 
@@ -175,7 +192,7 @@ class VolSurface:
         theta_ref = None
         if isinstance(instance, (SSVI, ESSVI)):
             for T, g in groups:
-                theta_by_T[T] = float(np.nanmin(g["iv"] ** 2 * g["maturity"]))
+                theta_by_T[T] = _atm_theta(g)
             theta_ref = float(np.median(list(theta_by_T.values())))
 
         slices = []
