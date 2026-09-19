@@ -263,9 +263,8 @@ def prepare_slice(
     iv_col: str = "iv",
     forward_col: str = "implied_forward",
     min_points: int = 5,
-) -> Tuple[
-    Optional[NDArray[np.float64]], Optional[NDArray[np.float64]], Optional[float]
-]:
+    return_index: bool = False,
+):
     """Transform single maturity slice to SVI-ready inputs: k, w_target, F.
 
     Pipeline:
@@ -290,11 +289,16 @@ def prepare_slice(
         F_{t,T} (constant per slice).
     min_points : int, default 5
         Minimum valid strikes required.
+    return_index : bool, default False
+        Also return the positional indices of the surviving rows (into
+        ``df_slice``), so companion columns (e.g. bid/ask implied vols)
+        can be filtered identically to the quotes.
 
     Returns
     -------
-    tuple[NDArray|None, NDArray|None, float|None]
-        (k, w_target, F) or (None, None, None) if invalid.
+    tuple
+        (k, w_target, F), or (k, w_target, F, index) with
+        ``return_index=True``; the entries are None if invalid.
 
     Notes
     -----
@@ -307,32 +311,36 @@ def prepare_slice(
     >>> prepare_slice(df)
     (array([-0.105,  0.   ,  0.095]), array([0.012, 0.010, 0.013]), 100.0)
     """
+    failed = (None, None, None, None) if return_index else (None, None, None)
     if df_slice.empty:
-        return None, None, None
+        return failed
 
     T = float(df_slice[maturity_col].iloc[0])
     if T <= 0:
-        return None, None, None
+        return failed
 
     F = float(df_slice[forward_col].iloc[0])
     if not np.isfinite(F) or F <= 0:
-        return None, None, None
+        return failed
 
     K = df_slice[strike_col].to_numpy(dtype=float)
     sigma_mkt = df_slice[iv_col].to_numpy(dtype=float)
 
     valid = np.isfinite(K) & np.isfinite(sigma_mkt) & (K > 0) & (sigma_mkt > 0)
     if np.sum(valid) < min_points:
-        return None, None, None
+        return failed
 
     K, sigma_mkt = K[valid], sigma_mkt[valid]
     k = np.log(K / F)
     w_target = sigma_mkt**2 * T
     finite = np.isfinite(k) & np.isfinite(w_target)
     if np.sum(finite) < min_points:
-        return None, None, None
+        return failed
 
     k = np.clip(k[finite], -10.0, 10.0)
+    if return_index:
+        sel = np.flatnonzero(valid)[finite]
+        return k, w_target[finite], F, sel
     return k, w_target[finite], F
 
 

@@ -37,8 +37,8 @@ from . import _kernels
 from .models import (
     ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, NaturalSVI, Parametrization,
     SABR, SSVI, SVI,
-    _initialization, _minimize_with_starts, _multistart_variants, _penalty_grid,
-    _prepare_loss_inputs, essvi_total_variance,
+    _initialization, _mad_scale, _minimize_with_starts, _multistart_variants,
+    _penalty_grid, _prepare_loss_inputs, essvi_total_variance,
 )
 from .calibration import calibrate_slice, get_model, prepare_slice
 from .diagnostics import ArbitrageReport, check_arbitrage
@@ -81,6 +81,48 @@ def _shape_like(values, original):
     return float(values[0]) if np.ndim(original) == 0 else values
 
 
+def _atm_theta(g) -> float:
+    """ATM total variance of a slice: w interpolated at k = 0.
+
+    SSVI fixes w(0) = theta exactly, so theta must be the ATM level --
+    the smile MINIMUM sits away from k = 0 on any skewed smile and
+    systematically understates the ATM vol, which the (rho, eta) fit
+    can never correct. Reads the cleaned inputs (prepare_slice) so a
+    junk quote cannot drive theta toward zero; falls back to the raw
+    minimum only for slices too thin to clean.
+    """
+    k, w, _ = prepare_slice(g)
+    if k is None:
+        return float(np.nanmin(g["iv"] ** 2 * g["maturity"]))
+    order = np.argsort(k)
+    return float(np.interp(0.0, k[order], w[order]))
+
+
+def _band_kwargs(g, T, k, w, sel, kwargs) -> None:
+    """Derive per-slice w_bid/w_ask for the bid_ask objective from the
+    panel's iv_bid/iv_ask columns (as OptionChain produces), filtered
+    exactly like the quotes. Rows whose band is missing or crossed
+    degenerate to a zero-width band at the mid (fit-to-mid there).
+    Explicit w_bid/w_ask kwargs win; absent columns leave the kwargs
+    untouched (the model then raises its usual requirement error).
+    """
+    if kwargs.get("objective") != "bid_ask":
+        return
+    if "w_bid" in kwargs or "w_ask" in kwargs:
+        return
+    if not ("iv_bid" in g.columns and "iv_ask" in g.columns):
+        return
+    iv_bid = g["iv_bid"].to_numpy(dtype=float)[sel]
+    iv_ask = g["iv_ask"].to_numpy(dtype=float)[sel]
+    w_bid = iv_bid ** 2 * T
+    w_ask = iv_ask ** 2 * T
+    bad = ~np.isfinite(w_bid) | ~np.isfinite(w_ask) | (w_bid > w_ask)
+    w_bid[bad] = w[bad]
+    w_ask[bad] = w[bad]
+    kwargs["w_bid"] = w_bid
+    kwargs["w_ask"] = w_ask
+
+
 def _auto_slice_kwargs(instance, T, df_slice, model_kwargs, theta_by_T, theta_ref):
     """Derive the per-slice calibrate kwargs for a model instance."""
     kwargs = dict(model_kwargs)
@@ -104,7 +146,7 @@ def _data_thetas(instance, groups):
     theta_ref = None
     if isinstance(instance, (SSVI, ESSVI)):
         for T, g in groups:
-            theta_by_T[T] = float(np.nanmin(g["iv"] ** 2 * g["maturity"]))
+            theta_by_T[T] = _atm_theta(g)
         theta_ref = float(np.median(list(theta_by_T.values())))
     return theta_by_T, theta_ref
 
@@ -271,7 +313,7 @@ class VolSurface:
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
             n_quotes = len(g)
-            k, w, F = prepare_slice(g)
+            k, w, F, sel = prepare_slice(g, return_index=True)
             if k is None:
                 if mode == "strict":
                     raise ValueError(
@@ -286,6 +328,7 @@ class VolSurface:
                     build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
                 )
                 continue
+            _band_kwargs(g, T, k, w, sel, kwargs)
             params = instance.calibrate(k, w, **kwargs)
             if params is None:
                 if mode == "strict":
@@ -816,7 +859,7 @@ def calibrate_surface(
     prepared = []
     slice_reports = []
     for T, g in groups:
-        k_i, w_i, F_i = prepare_slice(g)
+        k_i, w_i, F_i, sel_i = prepare_slice(g, return_index=True)
         if k_i is None:
             if mode == "strict":
                 raise ValueError(
@@ -831,7 +874,7 @@ def calibrate_surface(
                 build_slice_report(T, SLICE_INSUFFICIENT, len(g))
             )
             continue
-        prepared.append((T, g, k_i, w_i, F_i))
+        prepared.append((T, g, k_i, w_i, F_i, sel_i))
     if not prepared:
         raise ValueError("calibrate_surface: no usable slice in the panel")
 
@@ -854,10 +897,11 @@ def calibrate_surface(
     else:
         slices = []
         prev_params = None
-        for T, g, k_i, w_i, F_i in prepared:
+        for T, g, k_i, w_i, F_i, sel_i in prepared:
             kwargs = _auto_slice_kwargs(
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
+            _band_kwargs(g, T, k_i, w_i, sel_i, kwargs)
             if enforce_calendar and prev_params is not None:
                 grid = _penalty_grid(k_i)
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
@@ -883,7 +927,7 @@ def calibrate_surface(
         _warn_ssvi_admissibility(slices)
 
     params_by_T = dict(slices)
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         if T in params_by_T:
             w_fit = instance.total_variance(k_i, params_by_T[T])
             slice_reports.append(build_slice_report(
@@ -914,46 +958,88 @@ def _calibrate_essvi_global(
     init = _initialization(model_kwargs)
 
     ctx = []
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(
             k_i, w_i, model_kwargs
         )
         ctx.append((T, k_i, w_i, F_i, theta_by_T[T], mode, loss_code, weights))
     # one common grid spanning all slices, for butterfly and calendar
-    k_lo = min(float(item[1].min()) for item in ctx)
-    k_hi = max(float(item[1].max()) for item in ctx)
-    common_grid = np.linspace(k_lo - 0.5, k_hi + 0.5, 200)
+    # (the same grid policy as every per-slice penalty: _penalty_grid)
+    common_grid = _penalty_grid(np.concatenate([item[1] for item in ctx]))
     empty = np.empty(0)
 
-    f_scale = float(model_kwargs.get("f_scale", 1.0))
     core = _kernels.resolve("essvi_obj")
     theta_ref = float(theta_ref)
 
-    def objective(p):
-        p = np.asarray(p, dtype=np.float64)
-        total = 0.0
-        w_prev = empty
-        has_prev = False
-        for T, k_i, w_i, F_i, theta_i, mode, loss_code, weights in ctx:
-            total += core(
-                p, k_i, w_i, theta_i, theta_ref, common_grid, w_prev,
-                check_bf, enforce_calendar, has_prev,
-                mode, weights, empty, empty, loss_code, f_scale,
-            )
-            if enforce_calendar:
-                rho_t = ESSVI._rho_of(theta_i, theta_ref, p[0], p[1], p[2])
-                phi = p[3] / np.sqrt(theta_i)
-                w_prev = essvi_total_variance(common_grid, theta_i, rho_t, phi)
-                has_prev = True
-        return total
+    def make_objective(kernel, loss_override=None, f_scale_val=1.0):
+        def objective(p):
+            p = np.asarray(p, dtype=np.float64)
+            total = 0.0
+            w_prev = empty
+            has_prev = False
+            for T, k_i, w_i, F_i, theta_i, mode, loss_code, weights in ctx:
+                lc = loss_code if loss_override is None else loss_override
+                total += kernel(
+                    p, k_i, w_i, theta_i, theta_ref, common_grid, w_prev,
+                    check_bf, enforce_calendar, has_prev,
+                    mode, weights, empty, empty, lc, f_scale_val,
+                )
+                if enforce_calendar:
+                    rho_t = ESSVI._rho_of(theta_i, theta_ref, p[0], p[1], p[2])
+                    phi = p[3] / np.sqrt(theta_i)
+                    w_prev = essvi_total_variance(common_grid, theta_i, rho_t, phi)
+                    has_prev = True
+            return total
+        return objective
 
     x0 = np.array([0.0, -0.5, 0.5, 1.0])
     bounds = [(-0.999, 0.999), (-2.0, 2.0), (-2.0, 2.0), (1e-8, None)]
+    validity = lambda x: x[3] > 0
+    tight = {"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000}
+
+    # Robust-loss scale: same policy as every per-slice path
+    # (_resolve_f_scale) -- explicit kwarg wins; l2 needs none; else
+    # 1.4826 * MAD of the joint mode-space residuals at a pilot l2 fit.
+    f_scale = model_kwargs.get("f_scale")
+    is_l2 = all(item[6] == 0 for item in ctx)
+    if f_scale is not None:
+        f_scale = float(f_scale)
+    elif is_l2:
+        f_scale = 1.0
+    else:
+        pilot = _minimize_with_starts(
+            make_objective(core, loss_override=0, f_scale_val=1.0),
+            [x0], bounds, lbfgs_options=tight, nm_options={"maxiter": 2000},
+            validity=validity,
+        )
+        if pilot is not None:
+            rho0_p, rho1_p, alpha_p, eta_p = pilot.x
+            resid_k, resid_wm, resid_wt, resid_wgt = [], [], [], []
+            for T, k_i, w_i, F_i, theta_i, mode, loss_code, weights in ctx:
+                rho_t = ESSVI._rho_of(theta_i, theta_ref, rho0_p, rho1_p, alpha_p)
+                resid_k.append(k_i)
+                resid_wm.append(essvi_total_variance(
+                    k_i, theta_i, rho_t, eta_p / np.sqrt(theta_i)))
+                resid_wt.append(w_i)
+                resid_wgt.append(weights)
+            all_wgt = np.concatenate(resid_wgt) if resid_wgt[0].size else empty
+            f_scale = _mad_scale(
+                np.concatenate(resid_k), np.concatenate(resid_wm),
+                np.concatenate(resid_wt), ctx[0][5], all_wgt, empty, empty,
+            )
+        else:
+            f_scale = 1.0
+
+    objective = make_objective(core, f_scale_val=f_scale)
     starts = _multistart_variants(x0, 0, 3) if init == "multi_start" else [x0]
     res = _minimize_with_starts(
         objective, starts, bounds,
-        lbfgs_options={"ftol": 1e-15, "gtol": 1e-12, "maxiter": 1000},
+        lbfgs_options=tight,
         nm_options={"maxiter": 2000},
+        validity=validity,
+        rank_objective=make_objective(
+            _kernels._PLAIN["essvi_obj"], f_scale_val=f_scale
+        ),
     )
     if res is None:
         raise ValueError("calibrate_surface: joint eSSVI fit failed to converge")

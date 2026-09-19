@@ -69,8 +69,9 @@ def main() -> None:
 
     # The bid_ask objective fits inside the quoted band instead of to
     # the mid: residuals are zero anywhere between w_bid and w_ask.
-    # Real bid/ask IVs come from the snapshot quotes (example 05 gets
-    # them for free from OptionChain's iv_bid/iv_ask columns).
+    # Through the chain pipeline this is automatic -- example 05 fits
+    # with objective='bid_ask' straight off OptionChain's iv_bid/iv_ask
+    # columns; here we pass the band explicitly.
     spread_w = 0.04 * w                      # stand-in half-spread band
     params_ba = model.calibrate(
         k, w,

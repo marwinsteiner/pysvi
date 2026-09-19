@@ -299,3 +299,35 @@ def test_monotone_cubic_greeks_and_serialization(tmp_path):
     np.testing.assert_array_equal(
         np.atleast_1d(loaded.dw_dT(0.0, 0.7)),
         np.atleast_1d(surface.dw_dT(0.0, 0.7)))
+
+def test_joint_essvi_robust_loss_uses_pilot_scale(surface_df):
+    """The joint eSSVI fit resolves f_scale like every per-slice path
+    (pilot-l2 MAD), so robust losses actually resist an outlier instead
+    of silently degrading to l2 under f_scale = 1.0."""
+    corrupted = surface_df.copy()
+    idx = corrupted[corrupted["maturity"] == 0.5].index[0]
+    corrupted.loc[idx, "iv"] += 0.10  # one 10-vol-point outlier
+
+    def clean_rmse(surface):
+        errs = []
+        for T in (0.25, 0.5, 1.0):
+            g = surface_df[surface_df["maturity"] == T]
+            drop = g.index != idx
+            K = g["strike"].to_numpy()[drop]
+            errs.append(surface.iv(K, T) - g["iv"].to_numpy()[drop])
+        return float(np.sqrt(np.mean(np.concatenate(errs) ** 2)))
+
+    s_l2 = calibrate_surface(corrupted, model="essvi", r=R)
+    s_robust = calibrate_surface(corrupted, model="essvi", r=R, loss="cauchy")
+    assert clean_rmse(s_robust) <= clean_rmse(s_l2) * (1.0 + 1e-9)
+
+
+def test_joint_essvi_multi_start_valid(surface_df):
+    """multi_start on the joint path returns a valid, deterministic fit."""
+    s1 = calibrate_surface(surface_df, model="essvi", r=R,
+                           initialization="multi_start")
+    s2 = calibrate_surface(surface_df, model="essvi", r=R,
+                           initialization="multi_start")
+    p1 = s1.params(0.5); p2 = s2.params(0.5)
+    assert p1["eta"] > 0
+    assert p1 == p2  # deterministic

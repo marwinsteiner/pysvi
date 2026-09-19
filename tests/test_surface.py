@@ -294,3 +294,20 @@ def test_diagnose_direct_construction(svi_surface):
     diag = rebuilt.diagnose(k_data=np.linspace(-0.25, 0.25, 5))
     assert "not available" in str(diag)
     assert diag.ok == diag.arbitrage.ok
+
+
+def test_ssvi_theta_is_atm_not_smile_minimum(surface_df):
+    """theta must be the ATM (k = 0) total variance, not the smile
+    minimum: SSVI fixes w(0) = theta exactly, so a minimum readoff
+    biases every fitted ATM vol low on skewed smiles (was ~8% here)."""
+    from tests.conftest import SURFACE_RATE as R
+
+    surface = VolSurface.fit(surface_df, model="ssvi", r=R)
+    for T in surface.maturities:
+        g = surface_df[surface_df["maturity"] == T]
+        F = float(g["implied_forward"].iloc[0])
+        k = np.log(g["strike"].to_numpy() / F)
+        w = g["iv"].to_numpy() ** 2 * T
+        order = np.argsort(k)
+        atm_iv_mkt = float(np.sqrt(np.interp(0.0, k[order], w[order]) / T))
+        assert surface.atm_vol(T) == pytest.approx(atm_iv_mkt, rel=0.01), T
