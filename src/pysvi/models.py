@@ -434,6 +434,17 @@ def _prepare_loss_inputs(k, w_target, kwargs):
         w_hi = np.asarray(kwargs["w_ask"], dtype=np.float64)
         if w_lo.shape != w_target.shape or w_hi.shape != w_target.shape:
             raise ValueError("w_bid/w_ask must have the same shape as the quotes")
+        if np.any(w_lo > w_hi):
+            # A crossed band has an empty zero-residual region: the fit
+            # would silently converge to a meaningless curve. The usual
+            # cause is swapped kwargs (w_bid=iv_ask^2 T, w_ask=iv_bid^2 T)
+            # or crossed market quotes that should have been filtered.
+            n_crossed = int(np.sum(w_lo > w_hi))
+            raise ValueError(
+                f"objective='bid_ask': w_bid exceeds w_ask on {n_crossed} "
+                "quote(s) -- crossed band (swapped kwargs, or crossed "
+                "quotes that should be filtered upstream)"
+            )
     return mode, loss_code, weights, w_lo, w_hi
 
 
