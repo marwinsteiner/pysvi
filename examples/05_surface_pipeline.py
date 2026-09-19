@@ -63,6 +63,12 @@ def main() -> None:
     print(f"\nchain.fit(svi): {surface.fit_report.n_ok} slices ok, "
           f"max RMSE {max(rmses) * 1e4:.1f} bp")
 
+    # Fit INSIDE the quoted band instead of to the mid: the chain's
+    # iv_bid/iv_ask columns become per-slice w_bid/w_ask automatically.
+    s_band = chain.fit(model="svi", objective="bid_ask",
+                       initialization="multi_start")
+    print(f"chain.fit(svi, bid_ask): {s_band.fit_report.n_ok} slices ok")
+
     # ── Route 2: calendar-aware joint calibration ────────────────────
     # calibrate_surface chains each slice's total variance into the
     # next slice's calendar penalty; for eSSVI the shape parameters are

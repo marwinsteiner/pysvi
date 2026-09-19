@@ -135,3 +135,37 @@ def test_custom_column_names(raw_chain):
         renamed, strike="K", expiry="tte", cp="flag", bid="b", ask="a", rate=R,
     )
     assert len(chain.panel) == 63
+
+
+def test_bid_ask_objective_end_to_end(raw_chain):
+    """The advertised pipeline works: OptionChain's iv_bid/iv_ask
+    columns become per-slice w_bid/w_ask bands automatically when
+    fitting with objective='bid_ask' (regression: this used to raise
+    ValueError deep in _prepare_loss_inputs)."""
+    chain = OptionChain.from_dataframe(raw_chain, rate=R)
+    surface = chain.fit(model="svi", objective="bid_ask",
+                        initialization="multi_start")
+    assert surface.fit_report.ok
+    assert surface.fit_report.objective == "bid_ask"
+    # the fit lands inside the quoted band (bands bracket the truth)
+    panel = chain.panel
+    for T in chain.maturities:
+        g = panel[panel["maturity"] == T]
+        K = g["strike"].to_numpy()
+        iv_fit = surface.iv(K, float(T))
+        ok = np.isfinite(g["iv_bid"]) & np.isfinite(g["iv_ask"])
+        inside = ((iv_fit >= g["iv_bid"].to_numpy() - 5e-3)
+                  & (iv_fit <= g["iv_ask"].to_numpy() + 5e-3))
+        assert inside[ok.to_numpy()].mean() > 0.9, T
+
+
+def test_bid_ask_band_rows_with_nan_fall_back_to_mid(raw_chain):
+    """Rows whose band is missing degenerate to fit-to-mid, not NaN."""
+    from src.pysvi import calibrate_surface
+    chain = OptionChain.from_dataframe(raw_chain, rate=R)
+    panel = chain.panel
+    panel.loc[panel.index[:3], "iv_bid"] = np.nan
+    surface = calibrate_surface(panel, model="svi", enforce_calendar=False,
+                                objective="bid_ask",
+                                initialization="multi_start")
+    assert surface.fit_report.ok

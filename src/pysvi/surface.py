@@ -95,6 +95,31 @@ def _atm_theta(g) -> float:
     return float(np.interp(0.0, k[order], w[order]))
 
 
+def _band_kwargs(g, T, k, w, sel, kwargs) -> None:
+    """Derive per-slice w_bid/w_ask for the bid_ask objective from the
+    panel's iv_bid/iv_ask columns (as OptionChain produces), filtered
+    exactly like the quotes. Rows whose band is missing or crossed
+    degenerate to a zero-width band at the mid (fit-to-mid there).
+    Explicit w_bid/w_ask kwargs win; absent columns leave the kwargs
+    untouched (the model then raises its usual requirement error).
+    """
+    if kwargs.get("objective") != "bid_ask":
+        return
+    if "w_bid" in kwargs or "w_ask" in kwargs:
+        return
+    if not ("iv_bid" in g.columns and "iv_ask" in g.columns):
+        return
+    iv_bid = g["iv_bid"].to_numpy(dtype=float)[sel]
+    iv_ask = g["iv_ask"].to_numpy(dtype=float)[sel]
+    w_bid = iv_bid ** 2 * T
+    w_ask = iv_ask ** 2 * T
+    bad = ~np.isfinite(w_bid) | ~np.isfinite(w_ask) | (w_bid > w_ask)
+    w_bid[bad] = w[bad]
+    w_ask[bad] = w[bad]
+    kwargs["w_bid"] = w_bid
+    kwargs["w_ask"] = w_ask
+
+
 def _auto_slice_kwargs(instance, T, df_slice, model_kwargs, theta_by_T, theta_ref):
     """Derive the per-slice calibrate kwargs for a model instance."""
     kwargs = dict(model_kwargs)
@@ -265,7 +290,7 @@ class VolSurface:
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
             n_quotes = len(g)
-            k, w, F = prepare_slice(g)
+            k, w, F, sel = prepare_slice(g, return_index=True)
             if k is None:
                 logger.warning(
                     f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
@@ -274,6 +299,7 @@ class VolSurface:
                     build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
                 )
                 continue
+            _band_kwargs(g, T, k, w, sel, kwargs)
             params = instance.calibrate(k, w, **kwargs)
             if params is None:
                 logger.warning(
@@ -731,7 +757,7 @@ def calibrate_surface(
     prepared = []
     slice_reports = []
     for T, g in groups:
-        k_i, w_i, F_i = prepare_slice(g)
+        k_i, w_i, F_i, sel_i = prepare_slice(g, return_index=True)
         if k_i is None:
             logger.warning(
                 f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
@@ -740,7 +766,7 @@ def calibrate_surface(
                 build_slice_report(T, SLICE_INSUFFICIENT, len(g))
             )
             continue
-        prepared.append((T, g, k_i, w_i, F_i))
+        prepared.append((T, g, k_i, w_i, F_i, sel_i))
     if not prepared:
         raise ValueError("calibrate_surface: no usable slice in the panel")
 
@@ -763,10 +789,11 @@ def calibrate_surface(
     else:
         slices = []
         prev_params = None
-        for T, g, k_i, w_i, F_i in prepared:
+        for T, g, k_i, w_i, F_i, sel_i in prepared:
             kwargs = _auto_slice_kwargs(
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
+            _band_kwargs(g, T, k_i, w_i, sel_i, kwargs)
             if enforce_calendar and prev_params is not None:
                 grid = _penalty_grid(k_i)
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
@@ -786,7 +813,7 @@ def calibrate_surface(
         _warn_ssvi_admissibility(slices)
 
     params_by_T = dict(slices)
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         if T in params_by_T:
             w_fit = instance.total_variance(k_i, params_by_T[T])
             slice_reports.append(build_slice_report(
@@ -817,7 +844,7 @@ def _calibrate_essvi_global(
     init = _initialization(model_kwargs)
 
     ctx = []
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(
             k_i, w_i, model_kwargs
         )
