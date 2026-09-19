@@ -63,7 +63,7 @@ F = float(df_slice["implied_forward"].iloc[0])
 params = calibrate_slice(df_slice, model, T=T, F=F, beta=1.0)  # beta=1 for FX/equity
 ```
 
-See {doc}`models/index` for the full catalogue and when to use which model.
+See {doc}`models/index` for the full catalogue and when to use which model. For the complete pipeline from raw call/put quotes to a verified, persisted surface, see {doc}`example`.
 
 ## Numba acceleration
 
@@ -86,15 +86,35 @@ overhead, so gains there are modest. Kernels compile on first use in each
 process (a few seconds); measure your own workload with
 `python scripts/bench_numba.py`.
 
+For production services: `pysvi.warm_up()` compiles every kernel up front
+(indicatively ~15 s for the full set, versus ~2-3 s ambushing the first
+live request per model; near-zero when already warm), and
+`with pysvi.backend("numpy"/"numba"):` pins the backend per context
+(thread/async-task local) instead of mutating the process-global flag --
+safe for mixed concurrent workloads where `use_numba` is not. Disk
+caching of compiled kernels stays deliberately off: numba's cache keys
+on the importing module name, and the same source imported under two
+names poisons the cache with ModuleNotFoundError.
+
 ## Where do the inputs come from?
 
 `svi-py` expects you to already have implied volatilities and forward prices. If you're starting from raw option prices, the library provides helpers:
 
-- `compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib`.
+- `compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib` (whose inversion engine is Jäckel's ["Let's Be Rational"](https://github.com/vollib/lets_be_rational) — see {doc}`examples` for the method landscape).
 - `calculate_implied_forward` estimates the forward price from put-call parity:
 
 $$F = K + e^{rT}(C - P)$$
 
 - `choose_leg` selects the OTM leg (calls for $K \geq F$, puts for $K < F$) for cleaner vol quotes.
 
-You need a panel of **contemporaneous call and put option prices** across multiple strikes for at least one maturity. The richer the strike grid, the better the calibration. See {doc}`calibration` for pipeline details.
+Wherever a rate enters (implied forwards, `OptionChain` IV inversion), you can express your view of interest rates in any of four forms: a flat float; a fitted market curve as an [`interest_rate_models.DiscountCurve`](https://interest-rate-models.readthedocs.io) (interest-rate-models is a core dependency); an interest-rate model from the same package (Vasicek, Hull-White, ... -- its implied zero curve from today is used); or any callable $T \mapsto r(T)$, such as a `scipy.interpolate.CubicSpline` over your own curve pillars.
+
+```python
+import interest_rate_models as irm
+
+curve = irm.DiscountCurve.from_zero_rates(times, zero_rates)
+chain = OptionChain.from_dataframe(df, rate=curve)             # fitted curve
+chain = OptionChain.from_dataframe(df, rate=CubicSpline(t, r)) # custom spline
+```
+
+You need a panel of **contemporaneous call and put option prices** across multiple strikes for at least one maturity. The richer the strike grid, the better the calibration. See {doc}`calibration` for pipeline details, and {doc}`examples` for runnable scripts that build such a panel from real Yahoo Finance data without lookahead.
