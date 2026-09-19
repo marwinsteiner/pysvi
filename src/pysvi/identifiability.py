@@ -85,6 +85,38 @@ class ParameterUncertainty:
     rss: float
 
 
+def _uncertainty_with_workings(model, params, k, w_target):
+    """parameter_uncertainty plus the Jacobian and residuals it used,
+    so identifiability_report does not recompute them (the FD Jacobian
+    costs 2p total_variance evaluations for every model without an
+    analytic override)."""
+    k = np.asarray(k, dtype=np.float64)
+    w_target = np.asarray(w_target, dtype=np.float64)
+    names = tuple(model.free_params)
+    values = tuple(float(params[name]) for name in names)
+    J = model.param_jacobian(k, params)
+    n, p = J.shape
+    dof = n - p
+    resid = model.total_variance(k, params) - w_target
+    rss = float(np.dot(resid, resid))
+    if dof <= 0:
+        u = ParameterUncertainty(
+            names, values, tuple(float("inf") for _ in names),
+            np.full((p, p), np.nan), dof, rss,
+        )
+        return u, J, resid
+    sigma2 = rss / dof
+    cov = sigma2 * np.linalg.pinv(J.T @ J)
+    diag = np.sqrt(np.maximum(np.diag(cov), 0.0))
+    denom = np.outer(diag, diag)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = np.where(denom > 0.0, cov / denom, np.nan)
+    u = ParameterUncertainty(
+        names, values, tuple(float(d) for d in diag), corr, dof, rss,
+    )
+    return u, J, resid
+
+
 def parameter_uncertainty(
     model: Parametrization,
     params: Dict[str, float],
@@ -101,29 +133,8 @@ def parameter_uncertainty(
     ``n <= p`` the fit is under-determined and every standard error is
     inf.
     """
-    k = np.asarray(k, dtype=np.float64)
-    w_target = np.asarray(w_target, dtype=np.float64)
-    names = tuple(model.free_params)
-    values = tuple(float(params[name]) for name in names)
-    J = model.param_jacobian(k, params)
-    n, p = J.shape
-    dof = n - p
-    resid = model.total_variance(k, params) - w_target
-    rss = float(np.dot(resid, resid))
-    if dof <= 0:
-        return ParameterUncertainty(
-            names, values, tuple(float("inf") for _ in names),
-            np.full((p, p), np.nan), dof, rss,
-        )
-    sigma2 = rss / dof
-    cov = sigma2 * np.linalg.pinv(J.T @ J)
-    diag = np.sqrt(np.maximum(np.diag(cov), 0.0))
-    denom = np.outer(diag, diag)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        corr = np.where(denom > 0.0, cov / denom, np.nan)
-    return ParameterUncertainty(
-        names, values, tuple(float(d) for d in diag), corr, dof, rss,
-    )
+    u, _, _ = _uncertainty_with_workings(model, params, k, w_target)
+    return u
 
 
 @dataclass(frozen=True)
@@ -221,9 +232,7 @@ def identifiability_report(
     """
     k = np.asarray(k, dtype=np.float64)
     w_target = np.asarray(w_target, dtype=np.float64)
-    u = parameter_uncertainty(model, params, k, w_target)
-    J = model.param_jacobian(k, params)
-    resid = model.total_variance(k, params) - w_target
+    u, J, resid = _uncertainty_with_workings(model, params, k, w_target)
     poorly = tuple(
         name for name, v, se in zip(u.names, u.values, u.std_errors)
         if not np.isfinite(se) or se > rel_threshold * max(abs(v), 1e-12)

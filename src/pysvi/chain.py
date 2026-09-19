@@ -14,7 +14,7 @@ needed when both legs are quoted; a spot plus rate/dividend inputs serve
 only as the forward fallback for expiries missing put-call pairs.
 """
 
-from typing import Optional, Union
+from typing import Callable, Optional, Protocol, Union
 
 import numpy as np
 import pandas as pd
@@ -28,11 +28,19 @@ from .models import ArbitrageFreedom, Parametrization
 from .report import validate_mode
 from .surface import VolSurface, calibrate_surface
 
-#: A rate view in any accepted form: flat float, an
-#: interest_rate_models.DiscountCurve, an interest-rate model from
-#: interest_rate_models (Vasicek, Hull-White, ...), or any callable
-#: T -> r(T) such as a scipy CubicSpline over curve pillars.
-RateLike = Union[float, "callable", object]
+class _SupportsZeroRate(Protocol):
+    """Anything exposing zero rates: an interest_rate_models
+    DiscountCurve (one-argument, vectorized) or interest-rate model
+    (two-argument, from t to T)."""
+
+    def zero_rate(self, *args): ...
+
+
+#: A rate view in any accepted form: flat float; an
+#: interest_rate_models.DiscountCurve or interest-rate model (Vasicek,
+#: Hull-White, ...); or any callable T -> r(T), e.g. a scipy
+#: CubicSpline over curve pillars.
+RateLike = Union[float, Callable[[float], float], _SupportsZeroRate]
 
 
 def _invert_iv(price, F, K, r, T, flag) -> float:

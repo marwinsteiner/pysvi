@@ -143,11 +143,13 @@ def compute_ivs_vectorized(
                     float(ttes[i]),
                     r,
                     q,
-                    str(flags[i]).lower(),
+                    str(flags[i]).lower()[:1],  # 'call'/'put' -> 'c'/'p'
                 )
             )
         except (BelowIntrinsicException, AboveMaximumException, ValueError,
-                ZeroDivisionError, OverflowError):
+                KeyError, ZeroDivisionError, OverflowError):
+            # NaN-per-row contract: a bad row (unrecognized flag,
+            # uninvertible price) never aborts the batch.
             ivs[i] = np.nan
     return ivs
 
@@ -206,11 +208,18 @@ def calculate_implied_forward(
     1    101.26
     dtype: float64
     """
-    r_t = _rate_at(r, tte)
-    fwd = strike + np.exp(r_t * tte.astype(float).to_numpy()) * (
+    # Mask BEFORE evaluating the rate view: curve and model objects
+    # raise on non-positive times, where the float path just NaN'd the
+    # row -- invalid rows must stay NaN under every rate form.
+    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
+    tte_arr = tte.astype(float).to_numpy()
+    m = mask.to_numpy()
+    r_t = np.zeros(tte_arr.shape)
+    if m.any():
+        r_t[m] = np.asarray(_rate_at(r, tte_arr[m]), dtype=float)
+    fwd = strike + np.exp(r_t * tte_arr) * (
         call_mid.astype(float) - put_mid.astype(float)
     )
-    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
     return fwd.where(mask, np.nan)
 
 

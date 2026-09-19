@@ -455,14 +455,32 @@ class VolSurface:
     # ── Evaluation ───────────────────────────────────────────────────
 
     def _pchip(self, k: np.ndarray):
-        """Shape-preserving cubic in T at fixed k, over all fitted slices."""
+        """Shape-preserving cubic in T at fixed k, over all fitted slices.
+
+        Surfaces are immutable after construction, so interpolators are
+        cached per k-grid (small LRU): pricing a book at repeated
+        strikes no longer re-evaluates every slice and rebuilds the
+        PCHIP setup on each call.
+        """
         from scipy.interpolate import PchipInterpolator
 
+        cache = getattr(self, "_pchip_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_pchip_cache", cache)
+        key = (k.shape, k.tobytes())
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
         T_knots = np.array([T for T, _ in self._slices])
         W = np.vstack([
             self.model.total_variance(k, params) for _, params in self._slices
         ])
-        return PchipInterpolator(T_knots, W, axis=0, extrapolate=False)
+        interp = PchipInterpolator(T_knots, W, axis=0, extrapolate=False)
+        if len(cache) >= 16:  # bound memory for churning strike grids
+            cache.pop(next(iter(cache)))
+        cache[key] = interp
+        return interp
 
     def _w_at(self, k: np.ndarray, maturity) -> np.ndarray:
         loc = self._locate(maturity)
@@ -884,10 +902,19 @@ def calibrate_surface(
         raw = np.array([theta_by_T[T] for T in ordered_T])
         monotone = np.maximum.accumulate(raw)
         if np.any(monotone > raw):
-            logger.warning(
-                "calibrate_surface: per-slice ATM total variances were not "
-                "non-decreasing; clipped upward to enforce a monotone theta(T)"
-            )
+            if mode == "strict":
+                bad_T = [f"{T:g}" for T, r_i, m_i in
+                         zip(ordered_T, raw, monotone) if m_i > r_i]
+                raise ValueError(
+                    "calibrate_surface(mode='strict'): per-slice ATM total "
+                    "variances are not non-decreasing (calendar-arbitrageable "
+                    f"ATM term structure) at T = {', '.join(bad_T)}"
+                )
+            if mode == "warn":
+                logger.warning(
+                    "calibrate_surface: per-slice ATM total variances were not "
+                    "non-decreasing; clipped upward to enforce a monotone theta(T)"
+                )
         theta_by_T = dict(zip(ordered_T, (float(x) for x in monotone)))
 
     if isinstance(instance, ESSVI):
@@ -923,7 +950,7 @@ def calibrate_surface(
     if not slices:
         raise ValueError("calibrate_surface: no slice calibrated successfully")
 
-    if isinstance(instance, (SSVI, ESSVI)):
+    if isinstance(instance, (SSVI, ESSVI)) and mode != "lenient":
         _warn_ssvi_admissibility(slices)
 
     params_by_T = dict(slices)

@@ -77,10 +77,14 @@ def warm_up() -> float:
     service start -- before taking traffic -- to move the entire cost to
     startup. Includes two micro-calibrations so scipy's optimizer path
     is warm too; afterwards a first real calibration runs at steady-state
-    latency. A fast no-op when numba is not installed.
+    latency. Returns 0.0 immediately when numba is not installed --
+    there is nothing to compile, and the pure-NumPy path has no cold
+    start worth paying for at boot.
     """
     import time
 
+    if not _kernels.numba_available():
+        return 0.0
     t0 = time.perf_counter()
     _kernels.warm_up()
     k = np.linspace(-0.2, 0.2, 9)
