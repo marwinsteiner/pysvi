@@ -362,6 +362,16 @@ def _calendar_penalty(
     return float(_kernels.resolve("calendar")(w_current, w_prev))
 
 
+def _penalty_grid(k) -> NDArray[np.float64]:
+    """The NO_BUTTERFLY / NO_CALENDAR penalty evaluation grid.
+
+    The data range widened by 0.5 in log-moneyness, 200 points. A
+    ``w_prev`` array passed to ``calibrate`` must be evaluated on this
+    grid; ``calibrate_surface`` uses this helper for its chaining.
+    """
+    return np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+
+
 def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     """Common calibration setup for the fused objective kernels.
 
@@ -374,7 +384,7 @@ def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in arbitrage_condition
     check_calendar = ArbitrageFreedom.NO_CALENDAR in arbitrage_condition
     if check_butterfly or check_calendar:
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+        k_grid = _penalty_grid(k)
     else:
         k_grid = np.empty(0)
     w_prev = kwargs.get("w_prev")
@@ -572,6 +582,23 @@ def _baseline_options(init, mode, loss_code):
     if init != "multi_start":
         return None
     return _tight_if_controls("default", mode, loss_code) or {}
+
+
+def _rank_on_plain(objective, kernel_name):
+    """Rank multi-start candidates on the plain NumPy kernel.
+
+    fastmath reorders floating-point ops per CPU, and at near-tied
+    basins that platform noise decides the winner; re-scoring the final
+    candidates on the plain twin of the same objective gives every
+    platform the same ranking, while the optimization itself stays on
+    the fast kernels.
+    """
+    plain = _kernels._PLAIN[kernel_name]
+
+    def rank_objective(params):
+        return objective(params, _core=plain)
+
+    return rank_objective
 
 
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
@@ -891,13 +918,7 @@ class SVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["svi_obj"])
+        rank_objective = _rank_on_plain(objective, "svi_obj")
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1031,13 +1052,7 @@ class NaturalSVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["natural_obj"])
+        rank_objective = _rank_on_plain(objective, "natural_obj")
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1181,13 +1196,7 @@ class SSVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["ssvi_obj"])
+        rank_objective = _rank_on_plain(objective, "ssvi_obj")
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, 1.0])
@@ -1302,13 +1311,7 @@ class ESSVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["essvi_obj"])
+        rank_objective = _rank_on_plain(objective, "essvi_obj")
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
@@ -1453,13 +1456,7 @@ class JumpWings(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["jw_obj"])
+        rank_objective = _rank_on_plain(objective, "jw_obj")
 
         init = _initialization(kwargs)
         # Initial guess from market data
@@ -1700,6 +1697,19 @@ class DirectSVI(Parametrization):
                 "DirectSVI only supports QUASI arbitrage condition; "
                 "NO_BUTTERFLY / NO_CALENDAR flags are ignored."
             )
+        ignored = sorted(
+            key for key in ("objective", "loss", "f_scale", "initialization",
+                            "w_prev")
+            if key in kwargs
+        )
+        if ignored:
+            # The closed-form conic solve has no optimizer: controls
+            # cannot apply, and silently swallowing them would leave
+            # the fit report stamping settings that were never used.
+            logger.warning(
+                f"DirectSVI is a closed-form fit; calibration controls "
+                f"{ignored} are ignored."
+            )
 
         z = directsvi_fit(k, w_target)
         return {
@@ -1788,13 +1798,7 @@ class SABR(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["sabr_obj"])
+        rank_objective = _rank_on_plain(objective, "sabr_obj")
 
         init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
