@@ -69,6 +69,27 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Rebuild Read the Docs latest at the released tag
+      # The GitHub App auto-builds `latest` on the merge push, which
+      # lands BEFORE the tag exists -- hatch-vcs then stamps the docs
+      # with a .devN version. This explicit build runs after the tag is
+      # on the merge commit, so `latest` shows the exact released
+      # version. Skipped (with a notice) when RTD_TOKEN is not set;
+      # never fails the release.
+      if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      env:
+        RTD_TOKEN: ${{ secrets.RTD_TOKEN }}
+      run: |
+        if [ -z "$RTD_TOKEN" ]; then
+          echo "::notice::RTD_TOKEN secret not set; skipping Read the Docs rebuild (docs may show a dev version until rebuilt)."
+          exit 0
+        fi
+        curl --fail -sS -X POST \
+          -H "Authorization: Token ${RTD_TOKEN}" \
+          "https://readthedocs.org/api/v3/projects/pysvi/versions/latest/builds/" \
+          && echo "Read the Docs latest rebuild triggered." \
+          || echo "::warning::Read the Docs rebuild request failed; rebuild latest manually."
+
   deploy:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, release]
