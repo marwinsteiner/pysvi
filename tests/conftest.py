@@ -158,7 +158,9 @@ def jw_calibrated(atm_slice, backend_mode) -> Tuple[JumpWings, pd.DataFrame, Dic
     df_slice = atm_slice
     model = cast(JumpWings, get_model("jw"))
     T = float(df_slice["maturity"].iloc[0])
-    params = calibrate_slice(df_slice, model, T=T)
+    # multi_start: the single default start is platform-sensitive under
+    # fastmath (CI runners land in a slightly worse basin than local)
+    params = calibrate_slice(df_slice, model, T=T, initialization="multi_start")
     assert params is not None
     assert params["v_t"] > 0
     assert params["v_tilde_t"] > 0
