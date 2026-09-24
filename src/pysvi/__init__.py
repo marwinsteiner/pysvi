@@ -12,11 +12,24 @@ from .models import (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
                      jw_total_variance, directsvi_total_variance,
                      sabr_total_variance, sabr_implied_vol,
                      natural_total_variance, natural_to_raw, raw_to_natural,
-                     use_numba, numba_available)
+                     use_numba, numba_available, backend, warm_up)
 from .calibration import (prepare_slice, calibrate_slice, apply_slice,
                          calculate_implied_forward, get_model)
 from .diagnostics import (check_slice_arbitrage, check_arbitrage,
                           SliceArbitrageReport, ArbitrageReport, LEE_BOUND)
+from .surface import VolSurface, calibrate_surface
+from .report import (SurfaceFitReport, SliceFitReport, SurfaceDiagnostics)
+from .chain import OptionChain
+from .identifiability import (condition_number, parameter_uncertainty,
+                              identifiability_report,
+                              ParameterUncertainty, IdentifiabilityReport,
+                              quote_sensitivity, surface_sensitivity,
+                              iv_surface_sensitivity)
+from .diagnostics import (classify_arbitrage, ArbitrageClassification,
+                          CLASS_EXTRAPOLATION, CLASS_QUOTE_CONSISTENT,
+                          CLASS_EXECUTABLE, CLASS_MATHEMATICAL)
+from .surface import VarianceEvent, implied_event_variances
+from .context import MarketContext
 
 __all__ = [
     "SVI", "NaturalSVI", "SSVI", "ESSVI", "JumpWings", "DirectSVI", "SABR",
@@ -25,8 +38,18 @@ __all__ = [
     "jw_total_variance", "directsvi_total_variance",
     "sabr_total_variance", "sabr_implied_vol",
     "natural_total_variance", "natural_to_raw", "raw_to_natural",
-    "use_numba", "numba_available",
+    "use_numba", "numba_available", "backend", "warm_up",
     "check_slice_arbitrage", "check_arbitrage",
     "SliceArbitrageReport", "ArbitrageReport", "LEE_BOUND",
+    "VolSurface", "calibrate_surface",
+    "SurfaceFitReport", "SliceFitReport", "SurfaceDiagnostics",
+    "OptionChain",
+    "condition_number", "parameter_uncertainty", "identifiability_report",
+    "ParameterUncertainty", "IdentifiabilityReport",
+    "quote_sensitivity", "surface_sensitivity", "iv_surface_sensitivity",
+    "classify_arbitrage", "ArbitrageClassification",
+    "CLASS_EXTRAPOLATION", "CLASS_QUOTE_CONSISTENT",
+    "CLASS_EXECUTABLE", "CLASS_MATHEMATICAL",
+    "VarianceEvent", "implied_event_variances", "MarketContext",
     "prepare_slice", "calibrate_slice", "apply_slice", "calculate_implied_forward"
 ]

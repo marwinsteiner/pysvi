@@ -33,7 +33,30 @@ params = calibrate_slice(
 - `"jump_wings"` (SVI and NaturalSVI) — a data-driven start read off the quotes: wing slopes from the outer 20% of strikes on each side, skew from their asymmetry, vertex from the minimum-variance strike.
 - `"multi_start"` — a deterministic grid of starts (the default start plus skew and width variations, 16 total); each runs L-BFGS-B to tight tolerance and the result with the lowest objective value wins. The default start is additionally run under the default path's own settings, so `multi_start` can never return a worse fit than `default` with the same controls. Raw SVI's landscape has genuine bad basins that a single start can fall into — multi-start is the recommended setting whenever fit quality matters more than the last millisecond, and it is cheap under the numba backend.
 
+### Temporal stability: prior-anchored fits
+
+Two nearly identical markets can produce materially different parameters — the optimizer lands in an equivalent basin, and raw SVI coordinates are not equally meaningful. Every iterative model (and the surface fitters) accepts:
+
+```python
+params_today = model.calibrate(k, w, prior=params_yesterday, anchor=1.0)
+surface_today = VolSurface.fit(df, prior=surface_yesterday, anchor=1.0)
+```
+
+`prior` warm-starts from yesterday's parameters (with `multi_start` it becomes the base start of the grid); `anchor > 0` adds a Tikhonov pull `anchor * mean((w(k) - w_prior(k))^2)` on the penalty grid — anchoring the **surface shape**, not the raw parameters, so near-degenerate parameter directions are not pinned arbitrarily. `anchor=0` (the default) leaves the objective untouched, and identical quotes plus an identical prior give identical parameters.
+
 When any control is active the optimizer runs with tight tolerances (`ftol=1e-15`); the plain default path keeps scipy's defaults for backward-compatible fits.
+
+## Failure semantics: strict / warn / lenient
+
+The ingestion and fit entry points (`OptionChain.from_dataframe`, `chain.fit`, `VolSurface.fit`, `calibrate_surface`) take `mode`:
+
+- `"strict"` — the first bad input raises with its location: an invalid quote row (with its input row index), an expiry that cannot form a forward, a mid quote whose implied vol will not invert, a slice too thin to calibrate or that fails to converge (with its maturity).
+- `"warn"` (default) — problems are logged and recorded; the previous behaviour.
+- `"lenient"` — problems are filtered silently, but still recorded.
+
+**Nothing disappears without a count**: rejected quotes, failed inversions, and skipped expiries land on `chain.rejections` and flow onto the surface's fit report (`n_rejected_quotes`, `n_failed_inversions`, `n_skipped_expiries`, plus the per-slice quote accounting that was already there), in every mode. Schema errors — an unrecognized `cp` value, an unknown `mode` — raise in every mode: they are caller bugs, not bad data.
+
+The library installs no blanket warning suppression, and implied-vol inversion catches only the specific py_vollib failure exceptions (below intrinsic, above maximum, and numerical-domain errors); anything else propagates.
 
 ## Per-slice pipeline
 
@@ -54,13 +77,15 @@ If you're starting from raw option prices rather than implied vols:
 
 ### Implied volatilities
 
-`compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib`. Failures (e.g. below-intrinsic prices) come back as `NaN`.
+`compute_ivs_vectorized` computes Black-Scholes-Merton implied vols from option mid-prices via `py_vollib`. Failures (e.g. below-intrinsic prices) come back as `NaN`. Under the hood `py_vollib` inverts with Jäckel's ["Let's Be Rational"](https://github.com/vollib/lets_be_rational) algorithm (full machine precision in ~two price evaluations); see {doc}`examples` for a survey of inversion methods, including Schadner's explicit [Volfi](https://github.com/wol-fi/volfi) inverse.
 
 ### Implied forwards
 
 `calculate_implied_forward` estimates the forward price from put-call parity:
 
 $$F = K + e^{rT}(C - P)$$
+
+The rate (and every rate input in the library) accepts a flat float, an `interest_rate_models.DiscountCurve`, an interest-rate model from that package (its implied zero curve from today is used), or any callable $T \mapsto r(T)$ such as a cubic spline over curve pillars.
 
 ### OTM leg selection
 

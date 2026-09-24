@@ -4,7 +4,6 @@ High-level calibration pipeline for IV surfaces from option panels.
 Supports SVI, SSVI, eSSVI via models.Parametrization classes.
 """
 
-import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import re
@@ -13,7 +12,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from numpy.typing import NDArray
-from py_lets_be_rational.exceptions import BelowIntrinsicException
+from py_lets_be_rational.exceptions import (AboveMaximumException,
+                                             BelowIntrinsicException)
 from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
@@ -21,7 +21,40 @@ from py_vollib.black_scholes_merton.implied_volatility import (
 from .models import (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
                      Parametrization, ArbitrageFreedom)
 
-warnings.filterwarnings("ignore")
+
+def _rate_at(rate, tte):
+    """Resolve a rate specification to zero rates r(T) on times tte.
+
+    Every rate input in the library goes through here, so users can
+    express a view of interest rates in whichever form fits:
+
+    * a float -- flat continuously compounded rate (unchanged behaviour);
+    * an ``interest_rate_models.DiscountCurve`` (or any object with
+      vectorized ``zero_rate(t)`` and ``discount(t)``) -- a fitted
+      market curve;
+    * an interest-rate model from ``interest_rate_models`` (any object
+      with ``bond_price``/``zero_rate(t, T)``) -- the model's implied
+      zero curve from today, ``zero_rate(0, T)``;
+    * any callable T -> r(T) -- e.g. a ``scipy.interpolate.CubicSpline``
+      over curve pillars, or a lambda.
+
+    Vectorized over array-like tte in all cases.
+    """
+    if hasattr(rate, "zero_rate"):
+        arr = np.asarray(tte, dtype=float)
+        if hasattr(rate, "discount"):
+            # DiscountCurve-like: vectorized one-argument zero_rate(t)
+            flat = np.asarray(rate.zero_rate(arr), dtype=float)
+            return flat.reshape(arr.shape)
+        # interest-rate model: zero rate from today to each maturity
+        flat = np.array([float(rate.zero_rate(0.0, t)) for t in np.ravel(arr)])
+        return flat.reshape(arr.shape)
+    if callable(rate):
+        arr = np.asarray(tte, dtype=float)
+        flat = np.array([float(rate(t)) for t in np.ravel(arr)])
+        return flat.reshape(arr.shape)
+    return float(rate)
+
 
 _ticker_re = re.compile(r"SPY(\d{6})([CP])(\d+)")
 
@@ -110,10 +143,13 @@ def compute_ivs_vectorized(
                     float(ttes[i]),
                     r,
                     q,
-                    str(flags[i]).lower(),
+                    str(flags[i]).lower()[:1],  # 'call'/'put' -> 'c'/'p'
                 )
             )
-        except (BelowIntrinsicException, Exception):
+        except (BelowIntrinsicException, AboveMaximumException, ValueError,
+                KeyError, ZeroDivisionError, OverflowError):
+            # NaN-per-row contract: a bad row (unrecognized flag,
+            # uninvertible price) never aborts the batch.
             ivs[i] = np.nan
     return ivs
 
@@ -139,8 +175,10 @@ def calculate_implied_forward(
         Underlying spot price time series.
     tte : pd.Series
         Time-to-expiry (years) for this expiry.
-    r : float
-        Risk-free rate (constant, continuous).
+    r : float, curve, model, or callable
+        Continuously compounded risk-free rate in any form _rate_at
+        accepts: flat float, ``interest_rate_models.DiscountCurve``,
+        an interest-rate model, or a callable T -> r(T).
     strike : pd.Series
         Fixed strike (same value across series).
     call_mid : pd.Series
@@ -170,10 +208,18 @@ def calculate_implied_forward(
     1    101.26
     dtype: float64
     """
-    fwd = strike + np.exp(r * tte.astype(float)) * (
+    # Mask BEFORE evaluating the rate view: curve and model objects
+    # raise on non-positive times, where the float path just NaN'd the
+    # row -- invalid rows must stay NaN under every rate form.
+    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
+    tte_arr = tte.astype(float).to_numpy()
+    m = mask.to_numpy()
+    r_t = np.zeros(tte_arr.shape)
+    if m.any():
+        r_t[m] = np.asarray(_rate_at(r, tte_arr[m]), dtype=float)
+    fwd = strike + np.exp(r_t * tte_arr) * (
         call_mid.astype(float) - put_mid.astype(float)
     )
-    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
     return fwd.where(mask, np.nan)
 
 
@@ -226,9 +272,8 @@ def prepare_slice(
     iv_col: str = "iv",
     forward_col: str = "implied_forward",
     min_points: int = 5,
-) -> Tuple[
-    Optional[NDArray[np.float64]], Optional[NDArray[np.float64]], Optional[float]
-]:
+    return_index: bool = False,
+):
     """Transform single maturity slice to SVI-ready inputs: k, w_target, F.
 
     Pipeline:
@@ -253,11 +298,16 @@ def prepare_slice(
         F_{t,T} (constant per slice).
     min_points : int, default 5
         Minimum valid strikes required.
+    return_index : bool, default False
+        Also return the positional indices of the surviving rows (into
+        ``df_slice``), so companion columns (e.g. bid/ask implied vols)
+        can be filtered identically to the quotes.
 
     Returns
     -------
-    tuple[NDArray|None, NDArray|None, float|None]
-        (k, w_target, F) or (None, None, None) if invalid.
+    tuple
+        (k, w_target, F), or (k, w_target, F, index) with
+        ``return_index=True``; the entries are None if invalid.
 
     Notes
     -----
@@ -270,32 +320,36 @@ def prepare_slice(
     >>> prepare_slice(df)
     (array([-0.105,  0.   ,  0.095]), array([0.012, 0.010, 0.013]), 100.0)
     """
+    failed = (None, None, None, None) if return_index else (None, None, None)
     if df_slice.empty:
-        return None, None, None
+        return failed
 
     T = float(df_slice[maturity_col].iloc[0])
     if T <= 0:
-        return None, None, None
+        return failed
 
     F = float(df_slice[forward_col].iloc[0])
     if not np.isfinite(F) or F <= 0:
-        return None, None, None
+        return failed
 
     K = df_slice[strike_col].to_numpy(dtype=float)
     sigma_mkt = df_slice[iv_col].to_numpy(dtype=float)
 
     valid = np.isfinite(K) & np.isfinite(sigma_mkt) & (K > 0) & (sigma_mkt > 0)
     if np.sum(valid) < min_points:
-        return None, None, None
+        return failed
 
     K, sigma_mkt = K[valid], sigma_mkt[valid]
     k = np.log(K / F)
     w_target = sigma_mkt**2 * T
     finite = np.isfinite(k) & np.isfinite(w_target)
     if np.sum(finite) < min_points:
-        return None, None, None
+        return failed
 
     k = np.clip(k[finite], -10.0, 10.0)
+    if return_index:
+        sel = np.flatnonzero(valid)[finite]
+        return k, w_target[finite], F, sel
     return k, w_target[finite], F
 
 
