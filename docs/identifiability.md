@@ -43,6 +43,20 @@ A parameter is flagged when its standard error exceeds `rel_threshold` (default 
 - `condition_number(J)` — of the column-scaled Jacobian: how close the parameter directions are to collinear at the quotes.
 - `parameter_uncertainty(model, params, k, w)` — the Gauss-Newton covariance $\hat\sigma^2 (J^\top J)^+$ at the optimum, with $\hat\sigma^2 = \mathrm{RSS}/(n - p)$ in total-variance space, reported as standard errors and a correlation matrix. With $n \le p$ the fit is under-determined and every standard error is infinite.
 
+## Quote-to-surface sensitivities
+
+The same Gauss-Newton system answers the trader's question directly: *if this quote moves one vol point, what does the surface do?*
+
+```python
+from pysvi import quote_sensitivity, surface_sensitivity, iv_surface_sensitivity
+
+S_theta = quote_sensitivity(model, params, k, w)            # dtheta/dquote, p x n
+S_w     = surface_sensitivity(model, params, k, w, k_eval)  # dw(k_eval)/dquote
+S_iv    = iv_surface_sensitivity(model, params, k, w, k_eval, T)  # vol-in, vol-out
+```
+
+These are implicit-function Jacobians at the optimum — `(J^T J)^+ J^T` propagated through `dw/dtheta` — so one linear solve replaces a recalibration per bump: hedging, P&L explain and scenario responses in vectorized form. Valid to first order; verified against bump-and-recalibrate in the test suite.
+
 ## What to do with it
 
 - Widening the quoted strike range shrinks the uncertainties — often dramatically; the standard errors tell you whether today's chain supports the parameter you care about.
