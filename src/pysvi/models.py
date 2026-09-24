@@ -652,6 +652,61 @@ def _rank_on_plain(objective, kernel_name):
     return rank_objective
 
 
+def _prior_x0(model_self, kwargs, x0):
+    """Warm-start from a prior fit: kwargs['prior'] (a params dict from a
+    previous calibration of the same model) replaces the default start."""
+    prior = kwargs.get("prior")
+    if prior is None:
+        return x0
+    try:
+        return np.array([float(prior[name]) for name in model_self.free_params])
+    except KeyError as exc:
+        raise ValueError(
+            f"prior is missing parameter {exc} for {type(model_self).__name__}"
+        ) from None
+
+
+def _anchor_wrap(model_self, objective, rank_objective, kwargs, k):
+    """Tikhonov anchoring to a prior SURFACE SHAPE (issue #27).
+
+    With kwargs 'prior' (previous params dict) and 'anchor' (lambda > 0)
+    the objective gains ``anchor * mean((w(grid; theta) - w_prior(grid))^2)``
+    on the penalty grid. Anchoring the shape w rather than the raw
+    parameters is deliberate: raw SVI coordinates are not equally
+    meaningful and near-degenerate directions (see identifiability)
+    would be pinned arbitrarily hard. anchor=0 (default) reproduces the
+    unanchored fit exactly.
+    """
+    prior = kwargs.get("prior")
+    anchor = float(kwargs.get("anchor", 0.0))
+    if prior is None or anchor <= 0.0:
+        return objective, rank_objective
+    missing = [n for n in model_self.free_params if n not in prior]
+    if missing:
+        raise ValueError(
+            f"prior is missing parameter(s) {missing} for "
+            f"{type(model_self).__name__}"
+        )
+    grid = _penalty_grid(_as_f64(k))
+    template = {key: val for key, val in prior.items() if key != "forward"}
+    w_prior = model_self.total_variance(grid, template)
+
+    def _shape_penalty(p):
+        trial = dict(template)
+        trial.update(zip(model_self.free_params, (float(v) for v in p)))
+        w_trial = model_self.total_variance(grid, trial)
+        d = w_trial - w_prior
+        return anchor * float(np.mean(d * d))
+
+    def anchored(p):
+        return objective(p) + _shape_penalty(p)
+
+    def anchored_rank(p):
+        return rank_objective(p) + _shape_penalty(p)
+
+    return anchored, anchored_rank
+
+
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
                           nm_options=None, baseline_options=None,
                           validity=None, rank_objective=None):
@@ -1007,6 +1062,9 @@ class SVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "svi_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1034,6 +1092,7 @@ class SVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 2, 4) if init == "multi_start" else [x0]
         res = _minimize_with_starts(
             objective, starts, bounds,
@@ -1168,6 +1227,9 @@ class NaturalSVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "natural_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1206,6 +1268,7 @@ class NaturalSVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 2, 4) if init == "multi_start" else [x0]
         # Tight ftol/gtol as for SABR: total-variance MSEs are O(1e-8) even
         # mid-fit, so scipy's default relative ftol stops too early.
@@ -1345,6 +1408,9 @@ class SSVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "ssvi_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, 1.0])
@@ -1358,6 +1424,7 @@ class SSVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 0, 1) if init == "multi_start" else [x0]
         res = _minimize_with_starts(
             objective, starts, bounds,
@@ -1484,6 +1551,9 @@ class ESSVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "essvi_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
@@ -1498,6 +1568,7 @@ class ESSVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 0, 3) if init == "multi_start" else [x0]
         res = _minimize_with_starts(
             objective, starts, bounds,
@@ -1631,6 +1702,9 @@ class JumpWings(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "jw_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         # Initial guess from market data
@@ -1654,6 +1728,7 @@ class JumpWings(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = (
             _multistart_variants(x0, 1, 2, rho_values=(-0.5, -0.2, 0.0, 0.2, 0.5))
             if init == "multi_start" else [x0]
@@ -1875,7 +1950,7 @@ class DirectSVI(Parametrization):
             )
         ignored = sorted(
             key for key in ("objective", "loss", "f_scale", "initialization",
-                            "w_prev")
+                            "w_prev", "prior", "anchor")
             if key in kwargs
         )
         if ignored:
@@ -1977,6 +2052,9 @@ class SABR(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "sabr_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
@@ -1999,6 +2077,7 @@ class SABR(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 1, 2) if init == "multi_start" else [x0]
         # Tight ftol/gtol: total-variance MSEs are O(1e-8) even mid-fit, so
         # scipy's default relative ftol would declare convergence too early.

@@ -22,7 +22,14 @@ from .report import (SurfaceFitReport, SliceFitReport, SurfaceDiagnostics)
 from .chain import OptionChain
 from .identifiability import (condition_number, parameter_uncertainty,
                               identifiability_report,
-                              ParameterUncertainty, IdentifiabilityReport)
+                              ParameterUncertainty, IdentifiabilityReport,
+                              quote_sensitivity, surface_sensitivity,
+                              iv_surface_sensitivity)
+from .diagnostics import (classify_arbitrage, ArbitrageClassification,
+                          CLASS_EXTRAPOLATION, CLASS_QUOTE_CONSISTENT,
+                          CLASS_EXECUTABLE, CLASS_MATHEMATICAL)
+from .surface import VarianceEvent, implied_event_variances
+from .context import MarketContext
 
 __all__ = [
     "SVI", "NaturalSVI", "SSVI", "ESSVI", "JumpWings", "DirectSVI", "SABR",
@@ -39,5 +46,10 @@ __all__ = [
     "OptionChain",
     "condition_number", "parameter_uncertainty", "identifiability_report",
     "ParameterUncertainty", "IdentifiabilityReport",
+    "quote_sensitivity", "surface_sensitivity", "iv_surface_sensitivity",
+    "classify_arbitrage", "ArbitrageClassification",
+    "CLASS_EXTRAPOLATION", "CLASS_QUOTE_CONSISTENT",
+    "CLASS_EXECUTABLE", "CLASS_MATHEMATICAL",
+    "VarianceEvent", "implied_event_variances", "MarketContext",
     "prepare_slice", "calibrate_slice", "apply_slice", "calculate_implied_forward"
 ]

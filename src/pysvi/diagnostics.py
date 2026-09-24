@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
+from . import _kernels
 from .models import Parametrization
 
 #: Lee moment bound on total-variance wing slopes: limsup w(k)/abs(k) <= 2.
@@ -394,3 +395,152 @@ def check_arbitrage(
         min_calendar_k=min_k,
         min_calendar_pair=min_pair,
     )
+
+
+# ── Economic vs mathematical arbitrage (issue #31) ───────────────────
+
+#: Classification labels for arbitrage findings.
+CLASS_EXTRAPOLATION = "extrapolation_risk"
+CLASS_QUOTE_CONSISTENT = "quote_consistent"
+CLASS_EXECUTABLE = "executable"
+CLASS_MATHEMATICAL = "mathematical"
+
+
+@dataclass(frozen=True)
+class ArbitrageClassification:
+    """Economic classification of one slice's arbitrage findings.
+
+    The numerical diagnostics report mathematical evidence; this layer
+    says what that evidence MEANS: a violation outside the quoted
+    strike range is extrapolation risk (the model's wings, not a
+    trade); inside the range it is ``executable`` when a static
+    butterfly built from the quoted crossed prices (buy at ask, sell
+    at bid) has negative cost, ``quote_consistent`` when the violation
+    disappears inside the bid/ask uncertainty, and ``mathematical``
+    when no quote band is available to decide.
+    """
+
+    maturity: Optional[float]
+    finding: str          # "butterfly" | "lee" | "none"
+    k_violation: Optional[float]
+    classification: Optional[str]
+    detail: str
+
+    def __str__(self) -> str:
+        T = f"T={self.maturity:g}" if self.maturity is not None else "slice"
+        if self.finding == "none":
+            return f"{T}: clean"
+        return f"{T}: {self.finding} violation -> {self.classification} ({self.detail})"
+
+
+def _butterfly_cost_from_quotes(g, F, T, k_v):
+    """Worst-case (buy-at-ask, sell-at-bid) cost of the static butterfly
+    at the three quoted strikes nearest the violation; negative cost is
+    an executable arbitrage. Forward-normalized undiscounted Black
+    prices -- the sign is invariant to discounting and F scaling."""
+    black = _kernels.resolve("black_call")
+    q = g.dropna(subset=["iv_bid", "iv_ask"]).sort_values("strike")
+    if len(q) < 3:
+        return None
+    K = q["strike"].to_numpy(dtype=float)
+    k_q = np.log(K / F)
+    j = int(np.clip(np.searchsorted(k_q, k_v), 1, len(K) - 2))
+    K1, K2, K3 = K[j - 1], K[j], K[j + 1]
+    def price(i, side):
+        iv = float(q.iloc[i]["iv_" + side])
+        return black(float(k_q[i]), iv * iv * T)
+    # (K3-K2) C(K1) - (K3-K1) C(K2) + (K2-K1) C(K3) >= 0 arbitrage-free
+    return (
+        (K3 - K2) * price(j - 1, "ask")
+        - (K3 - K1) * price(j, "bid")
+        + (K2 - K1) * price(j + 1, "ask")
+    )
+
+
+def classify_arbitrage(surface, panel=None) -> tuple:
+    """Classify a surface's arbitrage findings economically.
+
+    Runs the diagnostics on the quoted range (as ``diagnose`` does) and
+    classifies each slice's butterfly/Lee finding:
+
+    * ``extrapolation_risk`` -- the violation sits outside the slice's
+      quoted strike range: a property of the model's wings, not a
+      constructible trade.
+    * ``executable`` -- inside the quoted range AND a static butterfly
+      built from the panel's bid/ask quotes around the violation has
+      negative worst-case cost (buy wings at ask, sell body at bid).
+    * ``quote_consistent`` -- inside the quoted range but the
+      worst-case butterfly cost is non-negative: the violation lives
+      within bid/ask uncertainty.
+    * ``mathematical`` -- inside the quoted range, but no ``panel``
+      with iv_bid/iv_ask was given to decide executability.
+
+    Parameters
+    ----------
+    surface : VolSurface
+        A fitted surface with a fit report (for the quoted ranges).
+    panel : pd.DataFrame, optional
+        Quote panel with iv_bid/iv_ask columns (as OptionChain
+        produces) for the executability test.
+
+    Returns
+    -------
+    tuple of ArbitrageClassification, one per fitted slice.
+    """
+    if surface.fit_report is None:
+        raise ValueError("classify_arbitrage requires a surface fit report")
+    report = surface.diagnose().arbitrage
+    ranges = {
+        s.maturity: (s.k_min, s.k_max)
+        for s in surface.fit_report.slices if s.k_min is not None
+    }
+    out = []
+    for sl in report.slices:
+        rng = ranges.get(sl.maturity)
+        if sl.ok:
+            out.append(ArbitrageClassification(sl.maturity, "none", None, None, "no violation"))
+            continue
+        finding = "butterfly" if not sl.butterfly_free else "lee"
+        k_v = sl.min_density_k if finding == "butterfly" else (
+            sl.k_min if abs(sl.left_wing_slope) > abs(sl.right_wing_slope) else sl.k_max
+        )
+        if rng is None or k_v is None or k_v < rng[0] or k_v > rng[1]:
+            out.append(ArbitrageClassification(
+                sl.maturity, finding, k_v, CLASS_EXTRAPOLATION,
+                "violation outside the quoted strike range",
+            ))
+            continue
+        if finding == "lee":
+            out.append(ArbitrageClassification(
+                sl.maturity, finding, k_v, CLASS_MATHEMATICAL,
+                "asymptotic wing bound; no static quoted portfolio tests it",
+            ))
+            continue
+        if panel is None or "iv_bid" not in getattr(panel, "columns", ()):
+            out.append(ArbitrageClassification(
+                sl.maturity, finding, k_v, CLASS_MATHEMATICAL,
+                "no bid/ask panel supplied to test executability",
+            ))
+            continue
+        g = panel[np.isclose(panel["maturity"], sl.maturity)]
+        F = float(g["implied_forward"].iloc[0]) if len(g) else None
+        cost = (
+            _butterfly_cost_from_quotes(g, F, float(sl.maturity), float(k_v))
+            if F else None
+        )
+        if cost is None:
+            out.append(ArbitrageClassification(
+                sl.maturity, finding, k_v, CLASS_MATHEMATICAL,
+                "insufficient two-sided quotes around the violation",
+            ))
+        elif cost < 0:
+            out.append(ArbitrageClassification(
+                sl.maturity, finding, k_v, CLASS_EXECUTABLE,
+                f"static butterfly at quoted prices costs {cost:.3e} < 0",
+            ))
+        else:
+            out.append(ArbitrageClassification(
+                sl.maturity, finding, k_v, CLASS_QUOTE_CONSISTENT,
+                f"worst-case butterfly cost {cost:.3e} >= 0: inside bid/ask uncertainty",
+            ))
+    return tuple(out)
