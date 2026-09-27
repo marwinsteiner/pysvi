@@ -341,11 +341,15 @@ class VolSurface:
                 # 'Slices that fail to calibrate are skipped with a
                 # warning' must hold for exceptions too (e.g.
                 # DirectSVI's closed form hits a singular matrix on a
-                # flat junk slice), not only for a None return.
-                logger.warning(
-                    f"VolSurface.fit: slice T={T:g} raised "
-                    f"{type(exc).__name__}: {exc}; skipping"
-                )
+                # flat junk slice), not only for a None return -- and
+                # strict mode surfaces it instead of swallowing it.
+                if mode == "strict":
+                    raise
+                if mode == "warn":
+                    logger.warning(
+                        f"VolSurface.fit: slice T={T:g} raised "
+                        f"{type(exc).__name__}: {exc}; skipping"
+                    )
                 params = None
             if params is None:
                 if mode == "strict":
@@ -952,10 +956,13 @@ def calibrate_surface(
             try:
                 params = instance.calibrate(k_i, w_i, **kwargs)
             except Exception as exc:  # noqa: BLE001 -- contract: skip + record
-                logger.warning(
-                    f"calibrate_surface: slice T={T:g} raised "
-                    f"{type(exc).__name__}: {exc}; skipping"
-                )
+                if mode == "strict":
+                    raise
+                if mode == "warn":
+                    logger.warning(
+                        f"calibrate_surface: slice T={T:g} raised "
+                        f"{type(exc).__name__}: {exc}; skipping"
+                    )
                 params = None
             if params is None:
                 if mode == "strict":
