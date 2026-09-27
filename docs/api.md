@@ -17,6 +17,22 @@
    :show-inheritance:
 ```
 
+## Surface
+
+```{eval-rst}
+.. automodule:: pysvi.surface
+   :members:
+   :show-inheritance:
+```
+
+## Reports
+
+```{eval-rst}
+.. automodule:: pysvi.report
+   :members:
+   :show-inheritance:
+```
+
 ## Diagnostics
 
 ```{eval-rst}

@@ -574,6 +574,23 @@ def _baseline_options(init, mode, loss_code):
     return _tight_if_controls("default", mode, loss_code) or {}
 
 
+def _rank_on_plain(objective, kernel_name):
+    """Rank multi-start candidates on the plain NumPy kernel.
+
+    fastmath reorders floating-point ops per CPU, and at near-tied
+    basins that platform noise decides the winner; re-scoring the final
+    candidates on the plain twin of the same objective gives every
+    platform the same ranking, while the optimization itself stays on
+    the fast kernels.
+    """
+    plain = _kernels._PLAIN[kernel_name]
+
+    def rank_objective(params):
+        return objective(params, _core=plain)
+
+    return rank_objective
+
+
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
                           nm_options=None, baseline_options=None,
                           validity=None, rank_objective=None):
@@ -752,6 +769,13 @@ class Parametrization(ABC):
     #: reach ~1e-2, far above the default diagnostics tolerance.
     fd_step: float = 1e-5
 
+    #: Default tolerance for the arbitrage diagnostics on this model.
+    #: Models whose derivatives are finite-differenced (SABR,
+    #: DirectSVI) carry density noise far above the analytic models'
+    #: 1e-8; their override keeps diagnose() from reporting false
+    #: violations on clean fits.
+    diagnostics_tol: float = 1e-8
+
     def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
@@ -891,13 +915,7 @@ class SVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["svi_obj"])
+        rank_objective = _rank_on_plain(objective, "svi_obj")
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1031,13 +1049,7 @@ class NaturalSVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["natural_obj"])
+        rank_objective = _rank_on_plain(objective, "natural_obj")
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1181,13 +1193,7 @@ class SSVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["ssvi_obj"])
+        rank_objective = _rank_on_plain(objective, "ssvi_obj")
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, 1.0])
@@ -1302,13 +1308,7 @@ class ESSVI(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["essvi_obj"])
+        rank_objective = _rank_on_plain(objective, "essvi_obj")
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
@@ -1453,17 +1453,12 @@ class JumpWings(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["jw_obj"])
+        rank_objective = _rank_on_plain(objective, "jw_obj")
 
         init = _initialization(kwargs)
         # Initial guess from market data
-        v_t0 = float(np.interp(0.0, k, w_target)) / T if T > 0 else 0.04
+        _o = np.argsort(k)  # np.interp needs ascending xp
+        v_t0 = float(np.interp(0.0, k[_o], w_target[_o])) / T if T > 0 else 0.04
         v_tilde_t0 = float(np.nanmin(w_target)) / T if T > 0 else 0.03
         x0 = np.array([max(v_t0, 1e-4), -0.1, 0.1, 0.1, max(v_tilde_t0, 1e-4)])
 
@@ -1678,6 +1673,8 @@ class DirectSVI(Parametrization):
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/directsvi.html
     """
 
+    diagnostics_tol = 1e-4
+
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
@@ -1699,6 +1696,19 @@ class DirectSVI(Parametrization):
             logger.warning(
                 "DirectSVI only supports QUASI arbitrage condition; "
                 "NO_BUTTERFLY / NO_CALENDAR flags are ignored."
+            )
+        ignored = sorted(
+            key for key in ("objective", "loss", "f_scale", "initialization",
+                            "w_prev")
+            if key in kwargs
+        )
+        if ignored:
+            # The closed-form conic solve has no optimizer: controls
+            # cannot apply, and silently swallowing them would leave
+            # the fit report stamping settings that were never used.
+            logger.warning(
+                f"DirectSVI is a closed-form fit; calibration controls "
+                f"{ignored} are ignored."
             )
 
         z = directsvi_fit(k, w_target)
@@ -1745,6 +1755,8 @@ class SABR(Parametrization):
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/sabr.html
     """
 
+    diagnostics_tol = 1e-4
+
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
@@ -1788,17 +1800,12 @@ class SABR(Parametrization):
                 mode, weights, w_lo, w_hi, loss_code, f_scale,
             )
 
-        def rank_objective(params):
-            # Rank multi-start candidates on the plain NumPy kernel:
-            # fastmath reorders floating-point ops per CPU, and at
-            # near-tied basins that platform noise decides the winner.
-            # The plain evaluation gives every platform the same
-            # ranking (the optimization itself stays on fast kernels).
-            return objective(params, _core=_kernels._PLAIN["sabr_obj"])
+        rank_objective = _rank_on_plain(objective, "sabr_obj")
 
         init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
-        w_atm = float(np.interp(0.0, k, w_target))
+        _o = np.argsort(k)  # np.interp needs ascending xp
+        w_atm = float(np.interp(0.0, k[_o], w_target[_o]))
         sigma_atm = np.sqrt(max(w_atm, 1e-12) / T)
         alpha0 = sigma_atm * F ** (1.0 - beta)
         x0 = np.array([max(alpha0, 1e-4), 0.0, 0.5])

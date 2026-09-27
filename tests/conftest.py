@@ -53,6 +53,29 @@ def atm_slice() -> pd.DataFrame:
     })
 
 
+# Flat rate used to build the surface_df forwards and to price in the
+# surface tests — defined once so fixture and assertions cannot drift.
+SURFACE_RATE = 0.02
+
+
+@pytest.fixture
+def surface_df() -> pd.DataFrame:
+    """Three-maturity synthetic panel: flat vol term structure, F = 100 e^{rT}."""
+    np.random.seed(7)
+    rows = []
+    base = {"a": 0.01, "b": 0.12, "rho": -0.6, "m": 0.01, "sigma": 0.25}
+    for T in (0.25, 0.5, 1.0):
+        F = 100.0 * np.exp(SURFACE_RATE * T)
+        k = np.linspace(-0.25, 0.25, 21)
+        w = svi_total_variance(k, **base) * (T / 0.25)  # calendar-monotone
+        iv = np.sqrt(w / T) + 0.0002 * np.random.randn(k.size)
+        rows.append(pd.DataFrame({
+            "strike": F * np.exp(k), "iv": iv,
+            "maturity": T, "implied_forward": F,
+        }))
+    return pd.concat(rows, ignore_index=True)
+
+
 def _valid_slice_for_prepare() -> pd.DataFrame:
     """Factory: not a fixture, can be called directly."""
     np.random.seed(42)

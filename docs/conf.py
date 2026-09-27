@@ -41,6 +41,9 @@ intersphinx_mapping = {
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
+# Same-named attributes on report/diagnostics dataclasses make implicit
+# python cross-references ambiguous; do not fail the strict build on them.
+suppress_warnings = ["ref.python"]
+
 html_theme = "furo"
-html_static_path = ["_static"]
 html_title = f"svi-py {release}"
