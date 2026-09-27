@@ -153,9 +153,13 @@ class SurfaceFitReport:
         return sum(s.n_used for s in self.slices)
 
     def quoted_range(self) -> Optional[Tuple[float, float]]:
-        """Union of the quoted log-moneyness ranges across fitted slices."""
-        lows = [s.k_min for s in self.slices if s.k_min is not None]
-        highs = [s.k_max for s in self.slices if s.k_max is not None]
+        """Union of the quoted log-moneyness ranges across slices that
+        actually made it into the surface -- a failed slice's range must
+        not widen the domain the diagnostics certify."""
+        lows = [s.k_min for s in self.slices
+                if s.k_min is not None and s.status == SLICE_OK]
+        highs = [s.k_max for s in self.slices
+                 if s.k_max is not None and s.status == SLICE_OK]
         if not lows:
             return None
         return min(lows), max(highs)
