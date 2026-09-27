@@ -197,7 +197,7 @@ def check_slice_arbitrage(
     k_min: float = -2.0,
     k_max: float = 2.0,
     n_grid: int = 801,
-    tol: float = 1e-8,
+    tol: Optional[float] = None,
     k_data=None,
 ) -> SliceArbitrageReport:
     """Check a single calibrated slice for butterfly arbitrage and Lee bounds.
@@ -226,7 +226,9 @@ def check_slice_arbitrage(
         verification covers the same domain calibration penalized.
     n_grid : int, default 801
         Grid resolution.
-    tol : float, default 1e-8
+    tol : float, optional
+        Defaults to the model's ``diagnostics_tol`` (1e-8 for the
+        analytic family, 1e-4 for finite-difference SABR/DirectSVI).
         Numerical tolerance for violations. For models with
         finite-difference derivatives (SABR, DirectSVI) the density
         carries FD noise well above this; use a looser tol (e.g. 1e-4)
@@ -262,6 +264,10 @@ def check_slice_arbitrage(
     else:
         min_g = float("nan")
         min_g_k = float("nan")
+    if tol is None:
+        # Model-aware default: finite-difference models (SABR,
+        # DirectSVI) carry density noise far above the analytic 1e-8.
+        tol = getattr(model, "diagnostics_tol", 1e-8)
     butterfly_free = n_invalid == 0 and min_g >= -tol
 
     slopes = model.wing_slopes(params)
@@ -306,7 +312,7 @@ def check_arbitrage(
     k_min: float = -2.0,
     k_max: float = 2.0,
     n_grid: int = 801,
-    tol: float = 1e-8,
+    tol: Optional[float] = None,
     k_data=None,
 ) -> ArbitrageReport:
     """Check calibrated slices across maturities for arbitrage.
@@ -385,7 +391,8 @@ def check_arbitrage(
                     min_pair = (t_prev, t_next)
         if min_pair is None:
             min_margin = float("nan")
-        elif min_margin < -tol:
+        elif min_margin < -(tol if tol is not None
+                            else getattr(model, "diagnostics_tol", 1e-8)):
             calendar_free = False
 
     return ArbitrageReport(

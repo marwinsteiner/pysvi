@@ -885,6 +885,13 @@ class Parametrization(ABC):
     #: reach ~1e-2, far above the default diagnostics tolerance.
     fd_step: float = 1e-5
 
+    #: Default tolerance for the arbitrage diagnostics on this model.
+    #: Models whose derivatives are finite-differenced (SABR,
+    #: DirectSVI) carry density noise far above the analytic models'
+    #: 1e-8; their override keeps diagnose() from reporting false
+    #: violations on clean fits.
+    diagnostics_tol: float = 1e-8
+
     #: Names of the parameters the optimizer actually fits, in order.
     #: Per-slice givens (theta, T, F, a fixed beta) and the stored
     #: 'forward' are not free and carry no uncertainty of their own.
@@ -1708,7 +1715,8 @@ class JumpWings(Parametrization):
 
         init = _initialization(kwargs)
         # Initial guess from market data
-        v_t0 = float(np.interp(0.0, k, w_target)) / T if T > 0 else 0.04
+        _o = np.argsort(k)  # np.interp needs ascending xp
+        v_t0 = float(np.interp(0.0, k[_o], w_target[_o])) / T if T > 0 else 0.04
         v_tilde_t0 = float(np.nanmin(w_target)) / T if T > 0 else 0.03
         x0 = np.array([max(v_t0, 1e-4), -0.1, 0.1, 0.1, max(v_tilde_t0, 1e-4)])
 
@@ -1924,6 +1932,8 @@ class DirectSVI(Parametrization):
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/directsvi.html
     """
 
+    diagnostics_tol = 1e-4
+
     free_params = ("z0", "z2", "z3", "z4", "z5")
 
     def calibrate(
@@ -2006,6 +2016,8 @@ class SABR(Parametrization):
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/sabr.html
     """
 
+    diagnostics_tol = 1e-4
+
     free_params = ("alpha", "rho", "nu")
 
     def calibrate(
@@ -2058,7 +2070,8 @@ class SABR(Parametrization):
 
         init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
-        w_atm = float(np.interp(0.0, k, w_target))
+        _o = np.argsort(k)  # np.interp needs ascending xp
+        w_atm = float(np.interp(0.0, k[_o], w_target[_o]))
         sigma_atm = np.sqrt(max(w_atm, 1e-12) / T)
         alpha0 = sigma_atm * F ** (1.0 - beta)
         x0 = np.array([max(alpha0, 1e-4), 0.0, 0.5])
