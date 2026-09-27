@@ -10,7 +10,7 @@ from pysvi import VolSurface
 surface = VolSurface.fit(df, model="svi", r=0.02)
 ```
 
-`df` is a multi-expiry panel in the `calibrate_slice` schema (`strike`, `iv`, `maturity`, `implied_forward`). Every parametrization works through the same call — per-slice extras are derived automatically ($\theta$ per slice for SSVI/eSSVI with $\theta_{\mathrm{ref}}$ defaulting to the median, $T$ for jump-wings, $T$/$F$ for SABR with $\beta$ overridable via kwargs), and the calibration controls (`objective`, `loss`, `initialization`, …) pass through to every slice:
+`df` is a multi-expiry panel in the `calibrate_slice` schema (`strike`, `iv`, `maturity`, `implied_forward`). Every parametrization works through the same call — per-slice extras are derived automatically ($\theta$ per slice for SSVI and eSSVI — plus, for eSSVI only, $\theta_{\mathrm{ref}}$ defaulting to the median across slices — $T$ for jump-wings, $T$/$F$ for SABR with $\beta$ overridable via kwargs), and the calibration controls (`objective`, `loss`, `initialization`, …) pass through to every slice:
 
 ```python
 surface = VolSurface.fit(df, model="ssvi", loss="soft_l1", initialization="multi_start")
