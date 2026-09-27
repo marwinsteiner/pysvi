@@ -1,6 +1,7 @@
 """VolSurface: fitting, evaluation, diagnostics, Black-76 pricing."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from src.pysvi.surface import VolSurface
@@ -311,3 +312,78 @@ def test_ssvi_theta_is_atm_not_smile_minimum(surface_df):
         order = np.argsort(k)
         atm_iv_mkt = float(np.sqrt(np.interp(0.0, k[order], w[order]) / T))
         assert surface.atm_vol(T) == pytest.approx(atm_iv_mkt, rel=0.01), T
+
+
+# ── Release-review regressions (v0.9.0) ──────────────────────────────
+
+def _junk_expiry(T=2.0, iv=np.nan):
+    return pd.DataFrame({
+        "strike": np.linspace(90.0, 110.0, 8), "iv": iv,
+        "maturity": T, "implied_forward": 100.0,
+    })
+
+
+def test_junk_expiry_cannot_poison_theta_ref(surface_df):
+    """One all-NaN expiry must not NaN theta_ref and take down every
+    eSSVI slice: the reference is the median of finite thetas only."""
+    poisoned = pd.concat([surface_df, _junk_expiry()], ignore_index=True)
+    surface = VolSurface.fit(poisoned, model="essvi")
+    assert surface.fit_report.n_ok == 3
+    assert surface.fit_report.n_failed == 1
+    assert not surface.fit_report.ok  # the junk slice stays visible
+
+
+def test_slice_exception_is_skipped_and_recorded(surface_df, monkeypatch):
+    """The skip-with-warning contract holds for exceptions raised inside
+    per-slice calibration, not only for a None return."""
+    from src.pysvi.models import SVI
+
+    calls = {"n": 0}
+    real = SVI.calibrate
+
+    def flaky(self, k, w_target, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # second slice blows up
+            raise np.linalg.LinAlgError("Singular matrix")
+        return real(self, k, w_target, **kwargs)
+
+    monkeypatch.setattr(SVI, "calibrate", flaky)
+    surface = VolSurface.fit(surface_df, model="svi")
+    assert surface.fit_report.n_ok == 2
+    assert surface.fit_report.n_failed == 1
+
+
+def test_diagnose_clean_for_fd_models(surface_df):
+    """diagnose() must not cry arbitrage on clean SABR/DirectSVI fits:
+    their FD-derivative density noise sits far above the analytic 1e-8,
+    and the default tolerance is now model-aware (diagnostics_tol)."""
+    from src.pysvi.models import SABR, DirectSVI
+    assert SABR().diagnostics_tol == 1e-4
+    assert DirectSVI().diagnostics_tol == 1e-4
+    for model in ("sabr", "dsvi"):
+        surface = VolSurface.fit(surface_df, model=model)
+        diag = surface.diagnose()
+        assert diag.arbitrage.ok, f"{model}: {diag.arbitrage}"
+
+
+def test_quoted_range_excludes_failed_slices(surface_df, monkeypatch):
+    """A failed slice's strike range must not widen the domain the
+    diagnostics certify."""
+    from src.pysvi.models import SVI
+
+    wide = pd.DataFrame({
+        "strike": 100.0 * np.exp(np.linspace(-2.0, 2.0, 15)),
+        "iv": 0.2, "maturity": 2.0, "implied_forward": 100.0,
+    })
+    real = SVI.calibrate
+
+    def fail_wide(self, k, w_target, **kwargs):
+        if k.size == 15:
+            return None  # the wide slice fails
+        return real(self, k, w_target, **kwargs)
+
+    monkeypatch.setattr(SVI, "calibrate", fail_wide)
+    surface = VolSurface.fit(
+        pd.concat([surface_df, wide], ignore_index=True), model="svi")
+    lo, hi = surface.fit_report.quoted_range()
+    assert hi < 1.0  # the failed slice's +/-2.0 range is excluded

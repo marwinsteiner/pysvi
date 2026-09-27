@@ -110,7 +110,12 @@ def _data_thetas(instance, groups):
     if isinstance(instance, (SSVI, ESSVI)):
         for T, g in groups:
             theta_by_T[T] = _atm_theta(g)
-        theta_ref = float(np.median(list(theta_by_T.values())))
+        # One junk expiry (all-NaN ivs, flat garbage) must not poison
+        # every other slice: the reference is the median of the FINITE,
+        # positive per-slice thetas only. Slices whose own theta is bad
+        # fail individually and are recorded.
+        good = [v for v in theta_by_T.values() if np.isfinite(v) and v > 0]
+        theta_ref = float(np.median(good)) if good else None
     return theta_by_T, theta_ref
 
 
@@ -157,7 +162,7 @@ class VolSurface:
         ],
         r: float = 0.0,
         interp_method: str = "total_variance",
-        fit_report: "SurfaceFitReport" = None,
+        fit_report: Optional["SurfaceFitReport"] = None,
     ) -> None:
         if isinstance(slices, Mapping):
             slices = slices.items()
@@ -208,8 +213,9 @@ class VolSurface:
         ``iv``, ``maturity``, ``implied_forward``, with multiple
         maturities in one DataFrame. Model-specific per-slice arguments
         are derived automatically: ``theta`` (ATM total variance) for
-        SSVI/eSSVI with ``theta_ref`` defaulting to the median across
-        slices, ``T`` for jump-wings, and ``T``/``F`` for SABR (``beta``
+        SSVI and eSSVI -- plus, for eSSVI only, ``theta_ref``
+        defaulting to the median across slices -- ``T`` for
+        jump-wings, and ``T``/``F`` for SABR (``beta``
         defaults to 0.5 — override via ``model_kwargs``).
 
         Calibration controls (``objective``, ``loss``, ``f_scale``,
@@ -265,7 +271,18 @@ class VolSurface:
                     build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
                 )
                 continue
-            params = instance.calibrate(k, w, **kwargs)
+            try:
+                params = instance.calibrate(k, w, **kwargs)
+            except Exception as exc:  # noqa: BLE001 -- contract: skip + record
+                # 'Slices that fail to calibrate are skipped with a
+                # warning' must hold for exceptions too (e.g.
+                # DirectSVI's closed form hits a singular matrix on a
+                # flat junk slice), not only for a None return.
+                logger.warning(
+                    f"VolSurface.fit: slice T={T:g} raised "
+                    f"{type(exc).__name__}: {exc}; skipping"
+                )
+                params = None
             if params is None:
                 logger.warning(
                     f"VolSurface.fit: slice T={T:g} failed to calibrate; skipping"
@@ -691,7 +708,14 @@ def calibrate_surface(
             if enforce_calendar and prev_params is not None:
                 grid = _penalty_grid(k_i)
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
-            params = instance.calibrate(k_i, w_i, **kwargs)
+            try:
+                params = instance.calibrate(k_i, w_i, **kwargs)
+            except Exception as exc:  # noqa: BLE001 -- contract: skip + record
+                logger.warning(
+                    f"calibrate_surface: slice T={T:g} raised "
+                    f"{type(exc).__name__}: {exc}; skipping"
+                )
+                params = None
             if params is None:
                 logger.warning(
                     f"calibrate_surface: slice T={T:g} failed to calibrate; skipping"
