@@ -276,6 +276,13 @@ class VolSurface:
                 continue
             try:
                 params = instance.calibrate(k, w, **kwargs)
+            except np.linalg.LinAlgError as exc:
+                # numerical failure (LinAlgError subclasses ValueError!):
+                # honor the skip-and-record contract
+                logger.warning(
+                    f"slice T={T:g} raised LinAlgError: {exc}; skipping"
+                )
+                params = None
             except ValueError:
                 # caller bugs (unknown loss/objective, missing kwargs)
                 # must surface, not dissolve into a skipped slice
@@ -739,6 +746,13 @@ def calibrate_surface(
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
             try:
                 params = instance.calibrate(k_i, w_i, **kwargs)
+            except np.linalg.LinAlgError as exc:
+                # numerical failure (LinAlgError subclasses ValueError!):
+                # honor the skip-and-record contract
+                logger.warning(
+                    f"slice T={T:g} raised LinAlgError: {exc}; skipping"
+                )
+                params = None
             except ValueError:
                 # caller bugs (unknown loss/objective, missing band or
                 # prior kwargs) must surface, not dissolve into
