@@ -362,6 +362,16 @@ def _calendar_penalty(
     return float(_kernels.resolve("calendar")(w_current, w_prev))
 
 
+def _penalty_grid(k) -> NDArray[np.float64]:
+    """The NO_BUTTERFLY / NO_CALENDAR penalty evaluation grid.
+
+    The data range widened by 0.5 in log-moneyness, 200 points. A
+    ``w_prev`` array passed to ``calibrate`` must be evaluated on this
+    grid; ``calibrate_surface`` uses this helper for its chaining.
+    """
+    return np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+
+
 def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     """Common calibration setup for the fused objective kernels.
 
@@ -374,7 +384,7 @@ def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in arbitrage_condition
     check_calendar = ArbitrageFreedom.NO_CALENDAR in arbitrage_condition
     if check_butterfly or check_calendar:
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+        k_grid = _penalty_grid(k)
     else:
         k_grid = np.empty(0)
     w_prev = kwargs.get("w_prev")
