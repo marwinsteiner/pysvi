@@ -114,12 +114,8 @@ def test_interpolated_w_between_bracketing_slices(ssvi_surface):
 
 
 def test_interpolated_slice_calendar_free(ssvi_surface):
-    """Calendar freedom survives interpolation (blend property + diagnostics)."""
-    from src.pysvi.diagnostics import check_arbitrage
-    synthetic = [
-        (T, None) for T in (0.3, 0.7)
-    ]
-    # build pseudo-slices by direct evaluation on the diagnostic grid
+    """Calendar freedom survives interpolation: total variance evaluated
+    at interpolated maturities stays ordered pairwise on the grid."""
     k = K_DATA
     ws = {T: ssvi_surface.total_variance(k, T) for T in (0.25, 0.3, 0.5, 0.7, 1.0)}
     for lo, hi in zip([0.25, 0.3, 0.5, 0.7], [0.3, 0.5, 0.7, 1.0]):
@@ -246,3 +242,60 @@ def test_joint_essvi_multi_start_valid(surface_df):
     p1 = s1.params(0.5); p2 = s2.params(0.5)
     assert p1["eta"] > 0
     assert p1 == p2  # deterministic
+
+
+# ── Release-review regressions (v0.10.0) ─────────────────────────────
+
+def test_caller_bugs_surface_instead_of_dissolving(surface_df):
+    """A typo'd control must raise, not dissolve into 'no slice
+    calibrated successfully' via the per-slice exception skip."""
+    with pytest.raises(ValueError, match="unknown loss"):
+        calibrate_surface(surface_df, model="ssvi", r=R, loss="cauchyy")
+    with pytest.raises(ValueError, match="w_bid"):
+        VolSurface.fit(surface_df, model="svi", objective="bid_ask")
+
+
+def test_no_calendar_flag_implies_enforcement(surface_df):
+    """arbitrage_condition=NO_CALENDAR must not be silently inert when
+    enforce_calendar=False: the flag means calendar enforcement."""
+    s = calibrate_surface(
+        surface_df, model="svi", r=R, enforce_calendar=False,
+        arbitrage_condition=ArbitrageFreedom.NO_CALENDAR,
+        initialization="multi_start",
+    )
+    assert s.check_arbitrage(k_data=K_DATA).calendar_free
+
+
+def test_theta_interp_with_rho_theta_only_slices():
+    """eSSVI slices carrying only rho_theta (documented as sufficient)
+    must interpolate without KeyError."""
+    essvi = get_model("essvi")
+    slices = {
+        0.25: {"theta": 0.02, "eta": 1.3, "rho_theta": -0.45, "forward": 100.5},
+        1.00: {"theta": 0.08, "eta": 1.3, "rho_theta": -0.52, "forward": 102.0},
+    }
+    s = VolSurface(essvi, slices, interp_method="theta")
+    mid = s.slice_at(0.5)
+    assert -0.52 < mid["rho_theta"] < -0.45
+    assert np.isfinite(s.iv(100.0, 0.5))
+
+
+def test_duplicate_maturities_raise_cleanly():
+    """Exact duplicate maturities hit the explicit ValueError, not a
+    TypeError from sorted() comparing params dicts."""
+    svi = get_model("svi")
+    p = {"a": 0.01, "b": 0.1, "rho": -0.5, "m": 0.0, "sigma": 0.2,
+         "forward": 100.0}
+    with pytest.raises(ValueError, match="duplicate maturities"):
+        VolSurface(svi, [(0.5, p), (0.5, dict(p))])
+
+
+def test_interp_method_validated_before_fitting(surface_df):
+    """A typo'd interp_method fails at entry, not after the full
+    multi-slice calibration."""
+    with pytest.raises(ValueError, match="unknown interp_method"):
+        calibrate_surface(surface_df, model="ssvi", r=R,
+                          interp_method="thota")
+    with pytest.raises(ValueError, match="requires an SSVI"):
+        calibrate_surface(surface_df, model="svi", r=R,
+                          interp_method="theta")
