@@ -41,8 +41,59 @@ def use_numba(enabled: bool = True) -> None:
     ------
     ImportError
         If enabling is requested but numba is not installed.
+
+    Notes
+    -----
+    This mutates a process-global flag, which is unsafe under concurrent
+    mixed workloads; prefer :func:`backend` for per-context control.
     """
     _kernels.use_numba(enabled)
+
+
+def backend(name: str):
+    """Context manager pinning the kernel backend for the enclosed block.
+
+    ::
+
+        with pysvi.backend("numpy"):
+            surface = VolSurface.fit(df)   # pure-NumPy kernels here
+
+    Unlike :func:`use_numba`, the choice is context-local (``contextvars``):
+    concurrent threads and async tasks each see their own backend, so a
+    web service can serve numba and NumPy requests side by side without
+    races. Contexts nest; the innermost wins.
+    """
+    return _kernels.backend(name)
+
+
+def warm_up() -> float:
+    """Compile every jitted kernel and warm the optimizer path; returns
+    the elapsed seconds.
+
+    Kernels compile lazily on first use, which costs a few seconds per
+    process per model (disk caching is deliberately off: numba's cache
+    keys on the importing module name, and the same source imported
+    under two names poisons the cache). Call ``pysvi.warm_up()`` once at
+    service start -- before taking traffic -- to move the entire cost to
+    startup. Includes two micro-calibrations so scipy's optimizer path
+    is warm too; afterwards a first real calibration runs at steady-state
+    latency. Returns 0.0 immediately when numba is not installed --
+    there is nothing to compile, and the pure-NumPy path has no cold
+    start worth paying for at boot.
+    """
+    import time
+
+    if not _kernels.numba_available():
+        return 0.0
+    t0 = time.perf_counter()
+    _kernels.warm_up()
+    k = np.linspace(-0.2, 0.2, 9)
+    w = 0.01 + 0.05 * k * k
+    SVI(ArbitrageFreedom.QUASI).calibrate(k, w)
+    SVI(ArbitrageFreedom.NO_BUTTERFLY | ArbitrageFreedom.NO_CALENDAR).calibrate(
+        k, w, w_prev=np.full(_penalty_grid(k).shape, 1e-4)
+    )
+    return time.perf_counter() - t0
 
 
 class ArbitrageFreedom(Flag):
@@ -362,6 +413,16 @@ def _calendar_penalty(
     return float(_kernels.resolve("calendar")(w_current, w_prev))
 
 
+def _penalty_grid(k) -> NDArray[np.float64]:
+    """The NO_BUTTERFLY / NO_CALENDAR penalty evaluation grid.
+
+    The data range widened by 0.5 in log-moneyness, 200 points. A
+    ``w_prev`` array passed to ``calibrate`` must be evaluated on this
+    grid; ``calibrate_surface`` uses this helper for its chaining.
+    """
+    return np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+
+
 def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     """Common calibration setup for the fused objective kernels.
 
@@ -374,7 +435,7 @@ def _prepare_objective_inputs(k, w_target, arbitrage_condition, kwargs):
     check_butterfly = ArbitrageFreedom.NO_BUTTERFLY in arbitrage_condition
     check_calendar = ArbitrageFreedom.NO_CALENDAR in arbitrage_condition
     if check_butterfly or check_calendar:
-        k_grid = np.linspace(float(k.min()) - 0.5, float(k.max()) + 0.5, 200)
+        k_grid = _penalty_grid(k)
     else:
         k_grid = np.empty(0)
     w_prev = kwargs.get("w_prev")
@@ -591,6 +652,61 @@ def _rank_on_plain(objective, kernel_name):
     return rank_objective
 
 
+def _prior_x0(model_self, kwargs, x0):
+    """Warm-start from a prior fit: kwargs['prior'] (a params dict from a
+    previous calibration of the same model) replaces the default start."""
+    prior = kwargs.get("prior")
+    if prior is None:
+        return x0
+    try:
+        return np.array([float(prior[name]) for name in model_self.free_params])
+    except KeyError as exc:
+        raise ValueError(
+            f"prior is missing parameter {exc} for {type(model_self).__name__}"
+        ) from None
+
+
+def _anchor_wrap(model_self, objective, rank_objective, kwargs, k):
+    """Tikhonov anchoring to a prior SURFACE SHAPE (issue #27).
+
+    With kwargs 'prior' (previous params dict) and 'anchor' (lambda > 0)
+    the objective gains ``anchor * mean((w(grid; theta) - w_prior(grid))^2)``
+    on the penalty grid. Anchoring the shape w rather than the raw
+    parameters is deliberate: raw SVI coordinates are not equally
+    meaningful and near-degenerate directions (see identifiability)
+    would be pinned arbitrarily hard. anchor=0 (default) reproduces the
+    unanchored fit exactly.
+    """
+    prior = kwargs.get("prior")
+    anchor = float(kwargs.get("anchor", 0.0))
+    if prior is None or anchor <= 0.0:
+        return objective, rank_objective
+    missing = [n for n in model_self.free_params if n not in prior]
+    if missing:
+        raise ValueError(
+            f"prior is missing parameter(s) {missing} for "
+            f"{type(model_self).__name__}"
+        )
+    grid = _penalty_grid(_as_f64(k))
+    template = {key: val for key, val in prior.items() if key != "forward"}
+    w_prior = model_self.total_variance(grid, template)
+
+    def _shape_penalty(p):
+        trial = dict(template)
+        trial.update(zip(model_self.free_params, (float(v) for v in p)))
+        w_trial = model_self.total_variance(grid, trial)
+        d = w_trial - w_prior
+        return anchor * float(np.mean(d * d))
+
+    def anchored(p):
+        return objective(p) + _shape_penalty(p)
+
+    def anchored_rank(p):
+        return rank_objective(p) + _shape_penalty(p)
+
+    return anchored, anchored_rank
+
+
 def _minimize_with_starts(objective, starts, bounds, lbfgs_options=None,
                           nm_options=None, baseline_options=None,
                           validity=None, rank_objective=None):
@@ -776,6 +892,41 @@ class Parametrization(ABC):
     #: violations on clean fits.
     diagnostics_tol: float = 1e-8
 
+    #: Names of the parameters the optimizer actually fits, in order.
+    #: Per-slice givens (theta, T, F, a fixed beta) and the stored
+    #: 'forward' are not free and carry no uncertainty of their own.
+    free_params: tuple = ()
+
+    def param_jacobian(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Sensitivity of total variance to the free parameters.
+
+        Returns the n x p matrix J with J[i, j] = dw(k_i)/dtheta_j for
+        theta_j in :attr:`free_params` -- the ingredient of every
+        identifiability and uncertainty statement (see
+        :mod:`pysvi.identifiability`). The base implementation uses
+        central finite differences with a relative step; models with
+        tractable derivatives override it analytically (SVI,
+        NaturalSVI, SSVI).
+        """
+        k = _as_f64(k)
+        if not self.free_params:
+            raise NotImplementedError(
+                f"{type(self).__name__} declares no free_params"
+            )
+        cols = []
+        for name in self.free_params:
+            v = float(params[name])
+            h = 1e-6 * max(1.0, abs(v))
+            up = dict(params); up[name] = v + h
+            dn = dict(params); dn[name] = v - h
+            cols.append(
+                (self.total_variance(k, up) - self.total_variance(k, dn))
+                / (2.0 * h)
+            )
+        return np.column_stack(cols)
+
     def derivatives(
         self, k: NDArray[np.float64], params: Dict[str, float]
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
@@ -884,6 +1035,8 @@ class SVI(Parametrization):
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/svi.html
     """
 
+    free_params = ("a", "b", "rho", "m", "sigma")
+
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
@@ -916,6 +1069,9 @@ class SVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "svi_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -943,6 +1099,7 @@ class SVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 2, 4) if init == "multi_start" else [x0]
         res = _minimize_with_starts(
             objective, starts, bounds,
@@ -991,6 +1148,31 @@ class SVI(Parametrization):
         return b * (1.0 - rho), b * (1.0 + rho)
 
 
+    def param_jacobian(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Analytic dw/d(a, b, rho, m, sigma).
+
+        With z = k - m and R = sqrt(z^2 + sigma^2)::
+
+            dw/da = 1            dw/db     = rho z + R
+            dw/drho = b z        dw/dm     = -b (rho + z / R)
+            dw/dsigma = b sigma / R
+        """
+        k = _as_f64(k)
+        b, rho, m, sigma = (
+            params["b"], params["rho"], params["m"], params["sigma"]
+        )
+        z = k - m
+        R = np.sqrt(z * z + sigma * sigma)
+        return np.column_stack([
+            np.ones_like(k),
+            rho * z + R,
+            b * z,
+            -b * (rho + z / R),
+            b * sigma / R,
+        ])
+
 class NaturalSVI(Parametrization):
     """Natural SVI parametrization [Gatheral & Jacquier 2014].
 
@@ -1015,6 +1197,8 @@ class NaturalSVI(Parametrization):
 
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/natural.html
     """
+
+    free_params = ("delta", "mu", "rho", "omega", "zeta")
 
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
@@ -1050,6 +1234,9 @@ class NaturalSVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "natural_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs, supports_jump_wings=True)
         if init == "jump_wings":
@@ -1088,6 +1275,7 @@ class NaturalSVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 2, 4) if init == "multi_start" else [x0]
         # Tight ftol/gtol as for SABR: total-variance MSEs are O(1e-8) even
         # mid-fit, so scipy's default relative ftol stops too early.
@@ -1143,6 +1331,37 @@ class NaturalSVI(Parametrization):
         return b * (1.0 - rho), b * (1.0 + rho)
 
 
+    def param_jacobian(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Analytic dw/d(delta, mu, rho, omega, zeta).
+
+        With z = k - mu, u = zeta z + rho and S = sqrt(u^2 + 1 - rho^2)::
+
+            dw/ddelta = 1
+            dw/dmu    = -(omega zeta / 2) (rho + u / S)
+            dw/drho   = (omega zeta z / 2) (1 + 1 / S)
+            dw/domega = (w - delta) / omega
+            dw/dzeta  = (omega z / 2) (rho + u / S)
+        """
+        k = _as_f64(k)
+        delta, mu, rho, omega, zeta = (
+            params["delta"], params["mu"], params["rho"],
+            params["omega"], params["zeta"],
+        )
+        z = k - mu
+        u = zeta * z + rho
+        S = np.sqrt(u * u + 1.0 - rho * rho)
+        inner = rho + u / S
+        w = delta + 0.5 * omega * (1.0 + zeta * rho * z + S)
+        return np.column_stack([
+            np.ones_like(k),
+            -0.5 * omega * zeta * inner,
+            0.5 * omega * zeta * z * (1.0 + 1.0 / S),
+            (w - delta) / omega,
+            0.5 * omega * z * inner,
+        ])
+
 class SSVI(Parametrization):
     """Surface-consistent SSVI [Gatheral & Jacquier 2014].
 
@@ -1158,6 +1377,8 @@ class SSVI(Parametrization):
 
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/ssvi.html
     """
+
+    free_params = ("rho", "eta")
 
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
@@ -1194,6 +1415,9 @@ class SSVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "ssvi_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, 1.0])
@@ -1207,6 +1431,7 @@ class SSVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 0, 1) if init == "multi_start" else [x0]
         res = _minimize_with_starts(
             objective, starts, bounds,
@@ -1249,6 +1474,28 @@ class SSVI(Parametrization):
         return 0.5 * theta * phi * (1.0 - rho), 0.5 * theta * phi * (1.0 + rho)
 
 
+    def param_jacobian(
+        self, k: NDArray[np.float64], params: Dict[str, float]
+    ) -> NDArray[np.float64]:
+        """Analytic dw/d(rho, eta), with theta a per-slice given.
+
+        With phi = eta / sqrt(theta), u = phi k + rho and
+        S = sqrt(u^2 + 1 - rho^2)::
+
+            dw/drho = (theta phi k / 2) (1 + 1 / S)
+            dw/deta = dw/dphi / sqrt(theta),
+            dw/dphi = (theta k / 2) (rho + u / S)
+        """
+        k = _as_f64(k)
+        theta, rho, eta = params["theta"], params["rho"], params["eta"]
+        sqrt_theta = np.sqrt(theta)
+        phi = eta / sqrt_theta
+        u = phi * k + rho
+        S = np.sqrt(u * u + 1.0 - rho * rho)
+        dw_drho = 0.5 * theta * phi * k * (1.0 + 1.0 / S)
+        dw_dphi = 0.5 * theta * k * (rho + u / S)
+        return np.column_stack([dw_drho, dw_dphi / sqrt_theta])
+
 class ESSVI(Parametrization):
     """Extended SSVI with ρ(θ) parametrization.
 
@@ -1264,6 +1511,8 @@ class ESSVI(Parametrization):
 
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/essvi.html
     """
+
+    free_params = ("rho0", "rho1", "alpha", "eta")
 
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
@@ -1309,6 +1558,9 @@ class ESSVI(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "essvi_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         x0 = np.array([0.0, -0.5, 0.5, 1.0])
@@ -1323,6 +1575,7 @@ class ESSVI(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 0, 3) if init == "multi_start" else [x0]
         res = _minimize_with_starts(
             objective, starts, bounds,
@@ -1418,6 +1671,8 @@ class JumpWings(Parametrization):
     Rendered formulas: https://pysvi.readthedocs.io/en/latest/models/jumpwings.html
     """
 
+    free_params = ("v_t", "psi_t", "p_t", "c_t", "v_tilde_t")
+
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
@@ -1454,6 +1709,9 @@ class JumpWings(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "jw_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         # Initial guess from market data
@@ -1478,6 +1736,7 @@ class JumpWings(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = (
             _multistart_variants(x0, 1, 2, rho_values=(-0.5, -0.2, 0.0, 0.2, 0.5))
             if init == "multi_start" else [x0]
@@ -1675,6 +1934,8 @@ class DirectSVI(Parametrization):
 
     diagnostics_tol = 1e-4
 
+    free_params = ("z0", "z2", "z3", "z4", "z5")
+
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
@@ -1699,7 +1960,7 @@ class DirectSVI(Parametrization):
             )
         ignored = sorted(
             key for key in ("objective", "loss", "f_scale", "initialization",
-                            "w_prev")
+                            "w_prev", "prior", "anchor")
             if key in kwargs
         )
         if ignored:
@@ -1757,6 +2018,8 @@ class SABR(Parametrization):
 
     diagnostics_tol = 1e-4
 
+    free_params = ("alpha", "rho", "nu")
+
     def calibrate(
         self, k: NDArray[np.float64], w_target: NDArray[np.float64], **kwargs
     ) -> Optional[Dict[str, float]]:
@@ -1801,6 +2064,9 @@ class SABR(Parametrization):
             )
 
         rank_objective = _rank_on_plain(objective, "sabr_obj")
+        objective, rank_objective = _anchor_wrap(
+            self, objective, rank_objective, kwargs, k
+        )
 
         init = _initialization(kwargs)
         # Initial guess: ATM vol maps to alpha via sigma_ATM ~ alpha / F^(1-beta)
@@ -1824,6 +2090,7 @@ class SABR(Parametrization):
                 k, w_target, kwargs, mode, weights, w_lo, w_hi
             ),
         )
+        x0 = _prior_x0(self, kwargs, x0)
         starts = _multistart_variants(x0, 1, 2) if init == "multi_start" else [x0]
         # Tight ftol/gtol: total-variance MSEs are O(1e-8) even mid-fit, so
         # scipy's default relative ftol would declare convergence too early.
