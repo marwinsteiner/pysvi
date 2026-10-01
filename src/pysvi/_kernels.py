@@ -22,6 +22,8 @@ backend at the level of floating-point rounding (~1e-15 relative), far below
 calibration noise.
 """
 
+import contextlib
+import contextvars
 import math
 import os
 
@@ -38,6 +40,13 @@ except ImportError:  # pragma: no cover - exercised via monkeypatch in tests
 _env = os.environ.get("PYSVI_NUMBA", "").strip().lower()
 _enabled = _NUMBA_AVAILABLE and _env not in ("0", "false", "off")
 
+#: Context-local override of the process-global backend flag. None means
+#: "use the global"; True/False pins the backend for the current context
+#: (thread or async task) without mutating shared state.
+_backend_override: contextvars.ContextVar = contextvars.ContextVar(
+    "pysvi_backend_override", default=None
+)
+
 
 def numba_available() -> bool:
     """True if numba is importable in this environment."""
@@ -45,14 +54,17 @@ def numba_available() -> bool:
 
 
 def numba_enabled() -> bool:
-    """True if jitted kernels are currently active."""
-    return _enabled
+    """True if jitted kernels are currently active in this context."""
+    override = _backend_override.get()
+    return _enabled if override is None else override
 
 
 def use_numba(enabled: bool = True) -> None:
-    """Enable or disable the numba backend at runtime.
+    """Enable or disable the numba backend process-wide at runtime.
 
-    Raises ImportError if numba is requested but not installed.
+    This mutates the global default; inside a :func:`backend` context the
+    context-local choice wins. Raises ImportError if numba is requested
+    but not installed.
     """
     global _enabled
     if enabled and not _NUMBA_AVAILABLE:
@@ -61,6 +73,38 @@ def use_numba(enabled: bool = True) -> None:
             '`pip install "svi-py[numba]"` to enable accelerated kernels.'
         )
     _enabled = bool(enabled)
+
+
+@contextlib.contextmanager
+def backend(name: str):
+    """Pin the kernel backend for the enclosed context, without touching
+    global state.
+
+    ::
+
+        with pysvi.backend("numpy"):
+            surface = VolSurface.fit(df)      # pure-NumPy kernels
+        with pysvi.backend("numba"):
+            params = model.calibrate(k, w)    # jitted kernels
+
+    The choice is context-local (``contextvars``): concurrent threads or
+    async tasks each see their own backend, which makes mixed workloads
+    safe in web services and worker pools where :func:`use_numba` --
+    a process-global mutation -- is not. Contexts nest; the innermost
+    wins. Raises ImportError for ``"numba"`` when numba is not installed.
+    """
+    if name not in ("numba", "numpy"):
+        raise ValueError(f"unknown backend {name!r}; choose 'numba' or 'numpy'")
+    if name == "numba" and not _NUMBA_AVAILABLE:
+        raise ImportError(
+            "numba is not installed; install the extra with "
+            '`pip install "svi-py[numba]"` to enable accelerated kernels.'
+        )
+    token = _backend_override.set(name == "numba")
+    try:
+        yield
+    finally:
+        _backend_override.reset(token)
 
 
 # ── Leaf kernels ─────────────────────────────────────────────────────
@@ -636,6 +680,67 @@ if _NUMBA_AVAILABLE:
 
 def resolve(name: str):
     """Return the active implementation (jitted if enabled) for a kernel."""
-    if _enabled and name in _JITTED:
+    if numba_enabled() and name in _JITTED:
         return _JITTED[name]
     return _PLAIN[name]
+
+
+def warm_up() -> float:
+    """Compile every jitted kernel now; returns the elapsed seconds.
+
+    Kernels otherwise compile lazily on first use (a few seconds per
+    process, since disk caching is off -- see the module docstring), which
+    is hostile to latency-sensitive services. Call this once at service
+    start, before taking traffic. A no-op (returning 0.0 quickly) when
+    numba is not installed or the jitted registry is empty.
+
+    The dummy invocations mirror the argument types the real call sites
+    use, so no further compilation happens on first real use.
+    """
+    import time
+
+    if not _JITTED:
+        return 0.0
+    t0 = time.perf_counter()
+    k = np.array([-0.1, 0.0, 0.1])
+    w = np.array([0.011, 0.010, 0.012])
+    grid = np.linspace(-0.5, 0.5, 5)
+    w_prev = np.full(5, 0.005)
+    empty = np.empty(0)
+    common = (True, True, True, 0, empty, empty, empty, 0, 1.0)
+
+    _JITTED["svi_w"](k, 0.01, 0.1, -0.5, 0.0, 0.2)
+    _JITTED["natural_convert"](0.01, 0.0, -0.5, 0.04, 1.5)
+    _JITTED["natural_w"](k, 0.01, 0.0, -0.5, 0.04, 1.5)
+    _JITTED["ssvi_w"](k, 0.02, -0.5, 1.3)
+    _JITTED["essvi_w"](k, 0.02, -0.5, 1.3)
+    _JITTED["jw_convert"](0.04, -0.1, 0.15, 0.05, 0.035, 0.5)
+    _JITTED["jw_w"](k, 0.04, -0.1, 0.15, 0.05, 0.035, 0.5)
+    _JITTED["sabr_vol"](k, 0.2, 0.5, -0.4, 0.6, 100.0, 0.5)
+    _JITTED["directsvi_w"](k, 0.01, 1.0, 0.1, 0.01, 0.01, 0.001)
+    _JITTED["svi_derivs"](k, 0.01, 0.1, -0.5, 0.0, 0.2)
+    _JITTED["ssvi_derivs"](k, 0.02, -0.5, 1.3)
+    w_g, dw_g, d2w_g = _JITTED["svi_derivs"](grid, 0.01, 0.1, -0.5, 0.0, 0.2)
+    _JITTED["density_g"](grid, w_g, dw_g, d2w_g)
+    _JITTED["butterfly"](grid, w_g, dw_g, d2w_g)
+    _JITTED["calendar"](w_g, w_prev)
+    _JITTED["finite_diff"](grid, w_g)
+    _JITTED["black_call"](0.1, 0.01)
+    _JITTED["loss_value"](k, w, w, 0, empty, empty, empty, 0, 1.0)
+    _JITTED["residuals"](k, w, w, 0, empty, empty, empty)
+    p5 = np.array([0.01, 0.1, -0.5, 0.0, 0.2])
+    _JITTED["svi_obj"](p5, k, w, grid, w_prev, *common)
+    _JITTED["natural_obj"](
+        np.array([0.01, 0.0, -0.5, 0.04, 1.5]), k, w, grid, w_prev, *common
+    )
+    _JITTED["ssvi_obj"](np.array([-0.5, 1.3]), k, w, 0.02, grid, w_prev, *common)
+    _JITTED["essvi_obj"](
+        np.array([-0.3, -0.2, 0.5, 1.3]), k, w, 0.02, 0.02, grid, w_prev, *common
+    )
+    _JITTED["jw_obj"](
+        np.array([0.04, -0.1, 0.15, 0.05, 0.035]), k, w, 0.5, grid, w_prev, *common
+    )
+    _JITTED["sabr_obj"](
+        np.array([0.2, -0.4, 0.6]), k, w, 0.5, 100.0, 0.5, grid, w_prev, *common
+    )
+    return time.perf_counter() - t0
