@@ -210,7 +210,10 @@ class VolSurface:
     ) -> None:
         if isinstance(slices, Mapping):
             slices = slices.items()
-        ordered = sorted((float(T), dict(params)) for T, params in slices)
+        ordered = sorted(
+            ((float(T), dict(params)) for T, params in slices),
+            key=lambda item: item[0],
+        )
         if not ordered:
             raise ValueError("VolSurface requires at least one calibrated slice")
         maturities = [T for T, _ in ordered]
@@ -337,6 +340,17 @@ class VolSurface:
             _band_kwargs(g, T, k, w, sel, kwargs)
             try:
                 params = instance.calibrate(k, w, **kwargs)
+            except np.linalg.LinAlgError as exc:
+                # numerical failure (LinAlgError subclasses ValueError!):
+                # honor the skip-and-record contract
+                logger.warning(
+                    f"slice T={T:g} raised LinAlgError: {exc}; skipping"
+                )
+                params = None
+            except ValueError:
+                # caller bugs (unknown loss/objective, missing kwargs)
+                # must surface, not dissolve into a skipped slice
+                raise
             except Exception as exc:  # noqa: BLE001 -- contract: skip + record
                 # 'Slices that fail to calibrate are skipped with a
                 # warning' must hold for exceptions too (e.g.
@@ -430,12 +444,17 @@ class VolSurface:
             (1.0 - lam) * np.log(p_lo["forward"])
             + lam * np.log(p_hi["forward"])
         ))
-        if "rho_theta" in blend and isinstance(self.model, ESSVI):
+        if (
+            "rho_theta" in blend and isinstance(self.model, ESSVI)
+            and all(key in blend for key in ("theta_ref", "rho0", "rho1", "alpha"))
+        ):
             # keep the stored rho(theta) consistent with the blended theta
             blend["rho_theta"] = self.model._rho_of(
                 blend["theta"], blend["theta_ref"],
                 blend["rho0"], blend["rho1"], blend["alpha"],
             )
+        # slices carrying only rho_theta (a shape _rho_phi documents as
+        # sufficient on its own) keep the linearly blended rho_theta
         return blend
 
     def slice_at(self, maturity) -> Dict[str, float]:
@@ -875,6 +894,12 @@ def calibrate_surface(
         if enforce_calendar:
             condition |= ArbitrageFreedom.NO_CALENDAR
         instance = get_model(model, condition)
+        # the converse must hold too: asking for NO_CALENDAR via the
+        # arbitrage condition means calendar enforcement, with chaining
+        enforce_calendar = (
+            enforce_calendar
+            or ArbitrageFreedom.NO_CALENDAR in instance.arbitrage_condition
+        )
     else:
         instance = model
         if enforce_calendar and ArbitrageFreedom.NO_CALENDAR not in instance.arbitrage_condition:
@@ -882,11 +907,22 @@ def calibrate_surface(
                 arbitrage_condition=instance.arbitrage_condition
                 | ArbitrageFreedom.NO_CALENDAR
             )
+        enforce_calendar = (
+            enforce_calendar
+            or ArbitrageFreedom.NO_CALENDAR in instance.arbitrage_condition
+        )
     if enforce_calendar and isinstance(instance, DirectSVI):
         raise ValueError(
             "DirectSVI does not support penalty-based calendar enforcement; "
             "use enforce_calendar=False or an iterative model"
         )
+
+    if interp_method not in _INTERP_METHODS:
+        raise ValueError(
+            f"unknown interp_method {interp_method!r}; choose from {_INTERP_METHODS}"
+        )
+    if interp_method == "theta" and not isinstance(instance, (SSVI, ESSVI)):
+        raise ValueError("interp_method='theta' requires an SSVI or eSSVI model")
 
     groups = sorted(
         ((float(T), g) for T, g in df.groupby("maturity")),
@@ -955,6 +991,18 @@ def calibrate_surface(
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
             try:
                 params = instance.calibrate(k_i, w_i, **kwargs)
+            except np.linalg.LinAlgError as exc:
+                # numerical failure (LinAlgError subclasses ValueError!):
+                # honor the skip-and-record contract
+                logger.warning(
+                    f"slice T={T:g} raised LinAlgError: {exc}; skipping"
+                )
+                params = None
+            except ValueError:
+                # caller bugs (unknown loss/objective, missing band or
+                # prior kwargs) must surface, not dissolve into
+                # 'no slice calibrated successfully'
+                raise
             except Exception as exc:  # noqa: BLE001 -- contract: skip + record
                 if mode == "strict":
                     raise
@@ -1029,7 +1077,8 @@ def _calibrate_essvi_global(
     core = _kernels.resolve("essvi_obj")
     theta_ref = float(theta_ref)
 
-    def make_objective(kernel, loss_override=None, f_scale_val=1.0):
+    def make_objective(kernel, loss_override=None, f_scale_val=1.0,
+                       w_fn=None):
         def objective(p):
             p = np.asarray(p, dtype=np.float64)
             total = 0.0
@@ -1045,7 +1094,12 @@ def _calibrate_essvi_global(
                 if enforce_calendar:
                     rho_t = ESSVI._rho_of(theta_i, theta_ref, p[0], p[1], p[2])
                     phi = p[3] / np.sqrt(theta_i)
-                    w_prev = essvi_total_variance(common_grid, theta_i, rho_t, phi)
+                    # the w kernel must match the objective kernel:
+                    # the plain-rank path stays fully plain, or the
+                    # chained w_prev reintroduces fastmath platform
+                    # noise into the candidate ranking
+                    w_eval = w_fn if w_fn is not None else essvi_total_variance
+                    w_prev = w_eval(common_grid, theta_i, rho_t, phi)
                     has_prev = True
             return total
         return objective
@@ -1096,7 +1150,8 @@ def _calibrate_essvi_global(
         nm_options={"maxiter": 2000},
         validity=validity,
         rank_objective=make_objective(
-            _kernels._PLAIN["essvi_obj"], f_scale_val=f_scale
+            _kernels._PLAIN["essvi_obj"], f_scale_val=f_scale,
+            w_fn=_kernels._PLAIN["essvi_w"],
         ),
     )
     if res is None:
