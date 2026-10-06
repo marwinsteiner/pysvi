@@ -9,3 +9,7 @@ src/pysvi/_version.py
 docs/_build/
 coverage.xml
 .coverage
+
+# examples: keep only the committed sample snapshot
+examples/data/spy_chain_2*
+examples/data/spy_surface.json
