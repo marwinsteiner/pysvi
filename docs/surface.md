@@ -16,7 +16,7 @@ surface = VolSurface.fit(df, model="svi", r=0.02)
 surface = VolSurface.fit(df, model="ssvi", loss="soft_l1", initialization="multi_start")
 ```
 
-Slices that fail to calibrate are skipped with a warning. A surface can also be assembled directly from calibrated slices: `VolSurface(model, {T: params, ...})`, where each params dict carries `'forward'` (as `calibrate_slice` returns).
+With `objective="bid_ask"`, panels carrying `iv_bid`/`iv_ask` columns (as `OptionChain` produces) get their per-slice `w_bid`/`w_ask` bands derived automatically — rows with a missing or crossed band degenerate to fit-to-mid. Slices that fail to calibrate are skipped with a warning. A surface can also be assembled directly from calibrated slices: `VolSurface(model, {T: params, ...})`, where each params dict carries `'forward'` (as `calibrate_slice` returns).
 
 ## Calendar-aware fitting
 
@@ -41,6 +41,7 @@ Between fitted maturities the surface interpolates; beyond the fitted range it r
 
 - `"total_variance"` (default, any model) — linear interpolation of $w(k)$ in $T$ at fixed log-moneyness. Model-agnostic, exact at fitted maturities, and calendar-free between two slices whenever they are ordered ($w$ of the blend lies between them at every $k$).
 - `"theta"` (SSVI/eSSVI) — interpolates the ATM total variance $\theta(T)$ and shape parameters, yielding a genuine parametric slice at any maturity; `surface.slice_at(T)` returns its params dict. Under a joint eSSVI fit the shape parameters are shared, so only $\theta$ actually interpolates.
+- `"monotone_cubic"` (any model, at least two slices) — a shape-preserving cubic (PCHIP, Fritsch–Carlson) in $T$ at fixed log-moneyness across **all** fitted slices. Exact at fitted maturities, monotone in $T$ wherever the fitted slices are (calendar-free slices stay calendar-free between expiries), and continuously differentiable in maturity — see Differentiability below.
 
 Forwards interpolate log-linearly in $T$ (piecewise-constant forward rate). All evaluation and pricing methods (`iv`, `total_variance`, `price`, Greeks, `atm_vol`, `skew`, `curvature`) accept any maturity in range; `params(T)` remains exact-slice-only, and `slice_at(T)` between slices requires the `"theta"` method.
 
@@ -49,6 +50,20 @@ surface = calibrate_surface(df, model="ssvi")
 surface.iv(100.0, 1.37)        # interpolated maturity
 surface.price(95.0, 1.37, "put")
 ```
+
+### Differentiability and Dupire-readiness
+
+`surface.regularity` declares the smoothness guarantee in maturity: `"C0"` for the linear blend and the theta method (continuous, but $\partial w/\partial T$ jumps at every fitted slice), `"C1"` for `"monotone_cubic"`. A C0 surface is **pricing-ready** — implied vols, prices, and sticky-strike Greeks are all well defined — but **not Dupire-ready**: local volatility, forward variance, and PDE coefficients consume $\partial w/\partial T$, which would be discontinuous exactly at the traded expiries.
+
+With `interp_method="monotone_cubic"` the maturity derivative exists and is continuous everywhere in the fitted range, exposed directly:
+
+```python
+surface = VolSurface.fit(df, model="svi", interp_method="monotone_cubic")
+surface.regularity        # "C1"
+surface.dw_dT(k, T)       # the Dupire numerator, any T in range
+```
+
+`dw_dT` on a C0 surface raises rather than return a one-sided number that would be silently wrong at the knots. Smoothness in strike comes from the model itself and is analytic for the SVI family under every method.
 
 ## Evaluation
 
@@ -64,6 +79,29 @@ surface.params(T)             # per-slice parameter dict
 ```
 
 All strike/moneyness inputs are vectorized; scalar in, scalar out. Any maturity inside the fitted range works (see Interpolation below); maturities outside it raise.
+
+## Variance events
+
+Real term structures contain known jumps — earnings, FOMC, CPI, elections. Generic maturity interpolation smooths across them, silently asserting all term-structure curvature is continuous variance. `VarianceEvent(time, variance, label)` makes the jump explicit:
+
+```python
+from pysvi import VarianceEvent, implied_event_variances
+
+surface = VolSurface.fit(df, events=[VarianceEvent(0.4, 0.006, "earnings")])
+```
+
+Total variance decomposes as $w(k,T) = w_{cont}(k,T) + \sum_{t_e \le T} v_e$: fitting subtracts each expiry's cumulative event variance (slices store the **continuous** component; events inconsistent with the quoted variance are rejected), interpolation acts on the continuous component, and evaluation adds the events back on the correct side of each event time — so the surface reproduces the jump exactly instead of smearing it, and the calendar diagnostics raise no false violation across an event. Events serialize with the surface; `dw_dT` reports the continuous derivative (the jump is a jump). `implied_event_variances(df, events)` reports the quoted ATM-variance jump straddling each event as an upper bound on its variance.
+
+## Evaluation status
+
+Every slice records its quoted strike range on the fit report, and evaluation can say whether a number is market information or model wing:
+
+```python
+iv, status = surface.iv(K, T, return_status=True)
+# status per point: "observed" | "interpolated" | "extrapolated"
+```
+
+`"observed"` means a fitted maturity inside that slice's quoted range; `"interpolated"` sits between fitted maturities inside the bracketing slices' joint quoted range; everything else is `"extrapolated"` — the model's wings, not the market. See also the economic arbitrage classification on the {doc}`arbitrage <arbitrage>` page.
 
 ## Fit reports and diagnostics
 

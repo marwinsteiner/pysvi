@@ -27,6 +27,7 @@ Conventions
 """
 
 from bisect import bisect_left
+from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -35,7 +36,8 @@ from scipy.special import ndtr
 
 from . import _kernels
 from .models import (
-    ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, Parametrization, SABR, SSVI,
+    ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, NaturalSVI, Parametrization,
+    SABR, SSVI, SVI,
     _initialization, _mad_scale, _minimize_with_starts, _multistart_variants,
     _penalty_grid, _prepare_loss_inputs, essvi_total_variance,
 )
@@ -44,11 +46,22 @@ from .diagnostics import ArbitrageReport, check_arbitrage
 from .report import (
     SLICE_FAILED, SLICE_INSUFFICIENT, SLICE_OK,
     SurfaceDiagnostics, SurfaceFitReport,
-    build_slice_report, build_surface_report,
+    build_slice_report, build_surface_report, validate_mode,
 )
 
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
-_INTERP_METHODS = ("total_variance", "theta")
+_INTERP_METHODS = ("total_variance", "theta", "monotone_cubic")
+
+#: Smoothness in maturity guaranteed by each interpolation method.
+_REGULARITY = {"total_variance": "C0", "theta": "C0", "monotone_cubic": "C1"}
+
+#: Serialization schema version written by VolSurface.save.
+_SCHEMA_VERSION = 1
+
+_MODEL_CLASSES = {
+    cls.__name__: cls
+    for cls in (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR)
+}
 
 
 def _npdf(x):
@@ -69,7 +82,55 @@ def _shape_like(values, original):
     return float(values[0]) if np.ndim(original) == 0 else values
 
 
-def _atm_theta(g) -> float:
+@dataclass(frozen=True)
+class VarianceEvent:
+    """A discrete variance event (earnings, FOMC, CPI, election).
+
+    Real term structures contain known jumps: generic maturity
+    interpolation smooths across them, silently asserting all
+    term-structure curvature is continuous variance. With events, total
+    variance decomposes as::
+
+        w(k, T) = w_cont(k, T) + sum of event variances with t_e <= T
+
+    Fitting subtracts each expiry's cumulative event variance before
+    calibration (slices store the CONTINUOUS component), interpolation
+    acts on the continuous component, and evaluation adds the events
+    back on the correct side of each event time -- so the surface
+    reproduces the jump exactly instead of smearing it, and the
+    calendar diagnostics (which see the continuous slices) raise no
+    false violation across an event.
+
+    Attributes
+    ----------
+    time : float
+        Event time as a year fraction (same clock as maturities).
+    variance : float
+        Total variance added by the event (ATM units, e.g.
+        sigma_event^2 * dt), non-negative.
+    label : str
+        Optional tag ("AAPL earnings", "FOMC").
+    """
+
+    time: float
+    variance: float
+    label: str = ""
+
+    def __post_init__(self):
+        if not (self.time > 0 and np.isfinite(self.time)):
+            raise ValueError(f"event time must be positive, got {self.time}")
+        if not (self.variance >= 0 and np.isfinite(self.variance)):
+            raise ValueError(
+                f"event variance must be non-negative, got {self.variance}"
+            )
+
+
+def _cum_event_variance(events, T) -> float:
+    """Total event variance realized by expiry T (events at t_e <= T)."""
+    return float(sum(e.variance for e in events if e.time <= T + 1e-12))
+
+
+def _atm_theta(g, event_var: float = 0.0) -> float:
     """ATM total variance of a slice: w interpolated at k = 0.
 
     SSVI fixes w(0) = theta exactly, so theta must be the ATM level --
@@ -81,9 +142,125 @@ def _atm_theta(g) -> float:
     """
     k, w, _ = prepare_slice(g)
     if k is None:
-        return float(np.nanmin(g["iv"] ** 2 * g["maturity"]))
+        return float(np.nanmin(g["iv"] ** 2 * g["maturity"])) - event_var
     order = np.argsort(k)
-    return float(np.interp(0.0, k[order], w[order]))
+    return float(np.interp(0.0, k[order], w[order])) - event_var
+
+
+def _subtract_events(w, events, T, mode):
+    """Continuous total variance: quoted w minus event variance by T.
+
+    Returns None (slice unusable) when the event variance exceeds the
+    quoted total variance anywhere -- the specified events are
+    inconsistent with the market; strict mode raises instead.
+    """
+    ev = _cum_event_variance(events, T)
+    if ev == 0.0:
+        return w
+    w_cont = w - ev
+    if np.any(w_cont <= 0):
+        msg = (
+            f"slice T={T:g}: cumulative event variance {ev:g} exceeds "
+            "the quoted total variance at some strikes -- the events "
+            "are inconsistent with the quoted term structure"
+        )
+        if mode == "strict":
+            raise ValueError(f"(mode='strict') {msg}")
+        if mode == "warn":
+            logger.warning(msg)
+        return None
+    return w_cont
+
+
+def _shift_band_events(kwargs, events, T) -> None:
+    """Shift bid/ask bands into continuous-variance space alongside w."""
+    ev = _cum_event_variance(events, T)
+    if ev and "w_bid" in kwargs:
+        kwargs["w_bid"] = kwargs["w_bid"] - ev
+        kwargs["w_ask"] = kwargs["w_ask"] - ev
+
+
+def implied_event_variances(df, events) -> list:
+    """What the quoted term structure says about each event's variance.
+
+    For every event, finds the quoted expiries straddling it and
+    reports the jump in ATM total variance across the event
+    (``atm_w(T_after) - atm_w(T_before)``) next to the variance the
+    event specifies. The quoted jump also contains the continuous
+    variance accrued between the two expiries, so it is an UPPER bound
+    on the event variance; a specified variance far above it is
+    inconsistent with the market.
+
+    Returns a list of dicts: {event, T_before, T_after, quoted_jump,
+    specified}. Events without straddling quotes report None bounds.
+    """
+    events = tuple(
+        (e if isinstance(e, VarianceEvent) else VarianceEvent(*e))
+        for e in events
+    )
+    atm = {}
+    for T, g in df.groupby("maturity"):
+        atm[float(T)] = _atm_theta(g)
+    Ts = sorted(atm)
+    out = []
+    for e in events:
+        before = [T for T in Ts if T < e.time]
+        after = [T for T in Ts if T >= e.time]
+        if not before or not after:
+            out.append({"event": e, "T_before": None, "T_after": None,
+                        "quoted_jump": None, "specified": e.variance})
+            continue
+        T1, T2 = before[-1], after[0]
+        out.append({
+            "event": e, "T_before": T1, "T_after": T2,
+            "quoted_jump": atm[T2] - atm[T1], "specified": e.variance,
+        })
+    return out
+
+
+def _prior_slice_kwargs(prior, anchor, T, kwargs) -> None:
+    """Attach the matching prior slice (by maturity) for temporal anchoring.
+
+    ``prior`` is a previously fitted VolSurface (or mapping T -> params);
+    slices are matched by np.isclose on maturity, unmatched slices fit
+    unanchored. See the calibrate() docs for 'prior'/'anchor'.
+    """
+    if prior is None:
+        return
+    items = prior._slices if isinstance(prior, VolSurface) else list(
+        prior.items() if hasattr(prior, "items") else prior
+    )
+    for T_p, params_p in items:
+        if np.isclose(float(T_p), T, rtol=1e-9, atol=1e-12):
+            kwargs.setdefault("prior", params_p)
+            if anchor:
+                kwargs.setdefault("anchor", float(anchor))
+            return
+
+
+def _band_kwargs(g, T, k, w, sel, kwargs) -> None:
+    """Derive per-slice w_bid/w_ask for the bid_ask objective from the
+    panel's iv_bid/iv_ask columns (as OptionChain produces), filtered
+    exactly like the quotes. Rows whose band is missing or crossed
+    degenerate to a zero-width band at the mid (fit-to-mid there).
+    Explicit w_bid/w_ask kwargs win; absent columns leave the kwargs
+    untouched (the model then raises its usual requirement error).
+    """
+    if kwargs.get("objective") != "bid_ask":
+        return
+    if "w_bid" in kwargs or "w_ask" in kwargs:
+        return
+    if not ("iv_bid" in g.columns and "iv_ask" in g.columns):
+        return
+    iv_bid = g["iv_bid"].to_numpy(dtype=float)[sel]
+    iv_ask = g["iv_ask"].to_numpy(dtype=float)[sel]
+    w_bid = iv_bid ** 2 * T
+    w_ask = iv_ask ** 2 * T
+    bad = ~np.isfinite(w_bid) | ~np.isfinite(w_ask) | (w_bid > w_ask)
+    w_bid[bad] = w[bad]
+    w_ask[bad] = w[bad]
+    kwargs["w_bid"] = w_bid
+    kwargs["w_ask"] = w_ask
 
 
 def _auto_slice_kwargs(instance, T, df_slice, model_kwargs, theta_by_T, theta_ref):
@@ -103,13 +280,14 @@ def _auto_slice_kwargs(instance, T, df_slice, model_kwargs, theta_by_T, theta_re
     return kwargs
 
 
-def _data_thetas(instance, groups):
-    """Per-slice ATM total variance for SSVI/eSSVI, plus the median ref."""
+def _data_thetas(instance, groups, events=()):
+    """Per-slice CONTINUOUS ATM total variance for SSVI/eSSVI (event
+    variance subtracted), plus the median ref."""
     theta_by_T: Dict[float, float] = {}
     theta_ref = None
     if isinstance(instance, (SSVI, ESSVI)):
         for T, g in groups:
-            theta_by_T[T] = _atm_theta(g)
+            theta_by_T[T] = _atm_theta(g, _cum_event_variance(events, T))
         # One junk expiry (all-NaN ivs, flat garbage) must not poison
         # every other slice: the reference is the median of the FINITE,
         # positive per-slice thetas only. Slices whose own theta is bad
@@ -147,6 +325,13 @@ class VolSurface:
         calendar-free whenever the bracketing slices are). "theta"
         (SSVI/eSSVI only) interpolates the ATM total variance and shape
         parameters, yielding a genuine parametric slice at any maturity.
+        "monotone_cubic" is a shape-preserving cubic (PCHIP,
+        Fritsch-Carlson) in maturity at fixed log-moneyness across ALL
+        fitted slices: continuously differentiable in T (C1, see
+        :attr:`regularity` and :meth:`dw_dT`), exact at fitted
+        maturities, and monotone in T wherever the fitted slices are --
+        so calendar-free slices stay calendar-free between expiries.
+        Requires at least two fitted slices.
     fit_report : SurfaceFitReport, optional
         Calibration provenance and per-slice evidence; populated by
         :meth:`fit` and :func:`calibrate_surface`, None on direct
@@ -163,6 +348,7 @@ class VolSurface:
         r: float = 0.0,
         interp_method: str = "total_variance",
         fit_report: Optional["SurfaceFitReport"] = None,
+        events=(),
     ) -> None:
         if isinstance(slices, Mapping):
             slices = slices.items()
@@ -192,6 +378,16 @@ class VolSurface:
             raise ValueError(
                 "interp_method='theta' requires an SSVI or eSSVI model"
             )
+        if interp_method == "monotone_cubic" and len(ordered) < 2:
+            raise ValueError(
+                "interp_method='monotone_cubic' requires at least two "
+                "fitted slices"
+            )
+        self.events = tuple(sorted(
+            ((e if isinstance(e, VarianceEvent) else VarianceEvent(*e))
+             for e in events),
+            key=lambda e: e.time,
+        ))
         self.model = model
         self.r = float(r)
         self.interp_method = interp_method
@@ -208,6 +404,10 @@ class VolSurface:
         arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI,
         r: float = 0.0,
         interp_method: str = "total_variance",
+        mode: str = "warn",
+        prior: "VolSurface" = None,
+        anchor: float = 0.0,
+        events=(),
         **model_kwargs,
     ) -> "VolSurface":
         """Calibrate every maturity slice of an option panel independently.
@@ -239,6 +439,12 @@ class VolSurface:
             Flat discount rate for the pricing layer.
         interp_method : str, default "total_variance"
             Maturity interpolation method (see the class docstring).
+        mode : str, default "warn"
+            Failure handling for slices. ``"strict"``: the first slice
+            that is too thin to calibrate or fails to converge raises
+            with its maturity. ``"warn"``: skipped with a logged
+            warning. ``"lenient"``: skipped silently. Every mode
+            records the failure on the fit report.
         **model_kwargs
             Forwarded to every per-slice calibration.
 
@@ -246,6 +452,7 @@ class VolSurface:
         -------
         VolSurface
         """
+        validate_mode(mode)
         instance = (
             get_model(model, arbitrage_condition)
             if isinstance(model, str) else model
@@ -257,7 +464,11 @@ class VolSurface:
         if not groups:
             raise ValueError("VolSurface.fit: empty input panel")
 
-        theta_by_T, theta_ref = _data_thetas(instance, groups)
+        events = tuple(
+            (e if isinstance(e, VarianceEvent) else VarianceEvent(*e))
+            for e in events
+        )
+        theta_by_T, theta_ref = _data_thetas(instance, groups, events)
         slices = []
         slice_reports = []
         for T, g in groups:
@@ -265,15 +476,26 @@ class VolSurface:
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
             n_quotes = len(g)
-            k, w, F = prepare_slice(g)
-            if k is None:
-                logger.warning(
-                    f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
-                )
+            k, w, F, sel = prepare_slice(g, return_index=True)
+            if k is not None:
+                w = _subtract_events(w, events, T, mode)
+            if k is None or w is None:
+                if mode == "strict":
+                    raise ValueError(
+                        f"VolSurface.fit(mode='strict'): slice T={T:g} has "
+                        f"insufficient data ({n_quotes} quotes before cleaning)"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
+                    )
                 slice_reports.append(
                     build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
                 )
                 continue
+            _band_kwargs(g, T, k, w, sel, kwargs)
+            _shift_band_events(kwargs, events, T)
+            _prior_slice_kwargs(prior, anchor, T, kwargs)
             try:
                 params = instance.calibrate(k, w, **kwargs)
             except np.linalg.LinAlgError as exc:
@@ -291,16 +513,26 @@ class VolSurface:
                 # 'Slices that fail to calibrate are skipped with a
                 # warning' must hold for exceptions too (e.g.
                 # DirectSVI's closed form hits a singular matrix on a
-                # flat junk slice), not only for a None return.
-                logger.warning(
-                    f"VolSurface.fit: slice T={T:g} raised "
-                    f"{type(exc).__name__}: {exc}; skipping"
-                )
+                # flat junk slice), not only for a None return -- and
+                # strict mode surfaces it instead of swallowing it.
+                if mode == "strict":
+                    raise
+                if mode == "warn":
+                    logger.warning(
+                        f"VolSurface.fit: slice T={T:g} raised "
+                        f"{type(exc).__name__}: {exc}; skipping"
+                    )
                 params = None
             if params is None:
-                logger.warning(
-                    f"VolSurface.fit: slice T={T:g} failed to calibrate; skipping"
-                )
+                if mode == "strict":
+                    raise ValueError(
+                        f"VolSurface.fit(mode='strict'): slice T={T:g} "
+                        "failed to calibrate"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"VolSurface.fit: slice T={T:g} failed to calibrate; skipping"
+                    )
                 slice_reports.append(
                     build_slice_report(T, SLICE_FAILED, n_quotes, k=k)
                 )
@@ -320,7 +552,7 @@ class VolSurface:
             calendar_enforced=False,
         )
         return cls(instance, slices, r=r, interp_method=interp_method,
-                   fit_report=report)
+                   fit_report=report, events=events)
 
     # ── Slice access and maturity location ───────────────────────────
 
@@ -396,9 +628,10 @@ class VolSurface:
             return dict(loc[2])
         if self.interp_method != "theta":
             raise ValueError(
-                "slice_at between fitted maturities requires "
-                "interp_method='theta' (the total-variance blend has no "
-                "parameter representation); evaluation methods such as "
+                "slice_at between fitted maturities requires a parametric "
+                "interpolation (interp_method='theta'); the total-variance "
+                "and monotone_cubic blends have no parameter "
+                "representation. Evaluation methods such as "
                 "iv/total_variance/price work at any maturity in range"
             )
         return self._theta_params(loc[1], loc[2], loc[3])
@@ -419,13 +652,50 @@ class VolSurface:
 
     # ── Evaluation ───────────────────────────────────────────────────
 
+    def _pchip(self, k: np.ndarray):
+        """Shape-preserving cubic in T at fixed k, over all fitted slices.
+
+        Surfaces are immutable after construction, so interpolators are
+        cached per k-grid (small LRU): pricing a book at repeated
+        strikes no longer re-evaluates every slice and rebuilds the
+        PCHIP setup on each call.
+        """
+        from scipy.interpolate import PchipInterpolator
+
+        cache = getattr(self, "_pchip_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_pchip_cache", cache)
+        key = (k.shape, k.tobytes())
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        T_knots = np.array([T for T, _ in self._slices])
+        W = np.vstack([
+            self.model.total_variance(k, params) for _, params in self._slices
+        ])
+        interp = PchipInterpolator(T_knots, W, axis=0, extrapolate=False)
+        if len(cache) >= 16:  # bound memory for churning strike grids
+            cache.pop(next(iter(cache)))
+        cache[key] = interp
+        return interp
+
     def _w_at(self, k: np.ndarray, maturity) -> np.ndarray:
+        """Total variance at maturity: the interpolated CONTINUOUS
+        component of the stored slices, plus the cumulative variance of
+        events realized by ``maturity`` (see :class:`VarianceEvent`)."""
+        ev = _cum_event_variance(self.events, float(maturity))
+        return self._w_cont_at(k, maturity) + ev
+
+    def _w_cont_at(self, k: np.ndarray, maturity) -> np.ndarray:
         loc = self._locate(maturity)
         if loc[0] == "exact":
             return self.model.total_variance(k, loc[2])
         lo, hi, lam = loc[1], loc[2], loc[3]
         if self.interp_method == "theta":
             return self.model.total_variance(k, self._theta_params(lo, hi, lam))
+        if self.interp_method == "monotone_cubic":
+            return self._pchip(k)(float(maturity))
         w_lo = self.model.total_variance(k, lo[1])
         w_hi = self.model.total_variance(k, hi[1])
         return (1.0 - lam) * w_lo + lam * w_hi
@@ -438,16 +708,78 @@ class VolSurface:
         lo, hi, lam = loc[1], loc[2], loc[3]
         if self.interp_method == "theta":
             return deriv(k, self._theta_params(lo, hi, lam))
+        if self.interp_method == "monotone_cubic":
+            # PCHIP slopes are nonlinear in the knot values, so the
+            # k-derivative of the interpolant is not the interpolant of
+            # the k-derivatives; central differences on the surface.
+            h = self.model.fd_step
+            fn = self._pchip(np.concatenate([k - h, k, k + h]))
+            row = fn(float(maturity))
+            n = k.shape[0]
+            w_m, w_0, w_p = row[:n], row[n:2 * n], row[2 * n:]
+            if second:
+                return (w_p - 2.0 * w_0 + w_m) / (h * h)
+            return (w_p - w_m) / (2.0 * h)
         # derivative of the linear blend is the blend of derivatives
         return (1.0 - lam) * deriv(k, lo[1]) + lam * deriv(k, hi[1])
+
+    @property
+    def regularity(self) -> str:
+        """Smoothness guarantee of the surface in maturity: "C0" or "C1".
+
+        "C0" (the default total-variance blend and the theta method):
+        w(k, T) is continuous in T but its maturity derivative jumps at
+        every fitted slice. Ready for implied vols, prices, and
+        sticky-strike Greeks; NOT ready for quantities that consume
+        dw/dT -- Dupire local volatility, forward variance, PDE
+        coefficients -- whose inputs would be discontinuous.
+
+        "C1" (interp_method="monotone_cubic"): dw/dT exists and is
+        continuous everywhere in the fitted maturity range (exposed via
+        :meth:`dw_dT`), making the surface Dupire-ready in maturity.
+        Smoothness in strike comes from the model itself and is
+        analytic (C-infinity) for the SVI family either way.
+        """
+        return _REGULARITY[self.interp_method]
+
+    def dw_dT(self, k, maturity):
+        """Maturity derivative of total variance, dw/dT at fixed k.
+
+        The Dupire numerator. Only available when the interpolation
+        method is C1 in maturity (interp_method="monotone_cubic");
+        the C0 methods have jump discontinuities at the fitted slices,
+        and a one-sided number there would be silently wrong.
+        """
+        if self.regularity != "C1":
+            raise ValueError(
+                f"dw_dT requires a C1 maturity interpolation; this surface "
+                f"uses interp_method={self.interp_method!r} (regularity "
+                f"{self.regularity}). Refit or construct with "
+                "interp_method='monotone_cubic'."
+            )
+        T = float(maturity)
+        self._locate(T)  # range check (raises outside the fitted range)
+        k_arr = np.atleast_1d(np.asarray(k, dtype=np.float64))
+        values = self._pchip(k_arr).derivative()(T)
+        return _shape_like(values, k)
 
     def total_variance(self, k, maturity):
         """Total variance w(k) at any maturity in the fitted range."""
         values = self._w_at(np.atleast_1d(np.asarray(k, dtype=np.float64)), maturity)
         return _shape_like(values, k)
 
-    def iv(self, strike, maturity):
-        """Implied volatility at absolute strike(s), any maturity in range."""
+    def iv(self, strike, maturity, return_status: bool = False):
+        """Implied volatility at absolute strike(s), any maturity in range.
+
+        With ``return_status=True`` also returns a domain-of-validity
+        label per point -- ``"observed"`` (a fitted maturity, inside
+        that slice's quoted strike range), ``"interpolated"`` (between
+        fitted maturities, inside the bracketing slices' joint quoted
+        range), or ``"extrapolated"`` (outside the quoted domain: the
+        model's wings, not market information). Requires a fit report
+        (surfaces constructed directly from parameter dicts carry no
+        quoted ranges and raise).
+        """
         T = float(maturity)
         F = self.forward(T)
         K = np.atleast_1d(np.asarray(strike, dtype=np.float64))
@@ -456,7 +788,45 @@ class VolSurface:
         k = np.log(K / F)
         w = self._w_at(k, T)
         sigma = np.sqrt(np.maximum(w, 0.0) / T)
-        return _shape_like(sigma, strike)
+        if not return_status:
+            return _shape_like(sigma, strike)
+        status = self._eval_status(k, T)
+        if np.ndim(strike) == 0:
+            return float(sigma[0]), str(status[0])
+        return sigma, status
+
+    def _quoted_range_of(self, T: float):
+        """Quoted (k_min, k_max) of the fitted slice at T, from the report."""
+        for s in self.fit_report.slices:
+            if np.isclose(s.maturity, T, rtol=1e-9, atol=1e-12) and s.k_min is not None:
+                return s.k_min, s.k_max
+        return None
+
+    def _eval_status(self, k: np.ndarray, T: float) -> np.ndarray:
+        if self.fit_report is None:
+            raise ValueError(
+                "evaluation status requires a fit report; surfaces "
+                "constructed directly from parameter dicts carry no "
+                "quoted ranges"
+            )
+        loc = self._locate(T)
+        if loc[0] == "exact":
+            rng = self._quoted_range_of(float(T))
+            in_T = "observed"
+        else:
+            (T_lo, _), (T_hi, _) = loc[1], loc[2]
+            r_lo = self._quoted_range_of(float(T_lo))
+            r_hi = self._quoted_range_of(float(T_hi))
+            if r_lo is None or r_hi is None:
+                rng = r_lo or r_hi
+            else:
+                rng = (max(r_lo[0], r_hi[0]), min(r_lo[1], r_hi[1]))
+            in_T = "interpolated"
+        status = np.full(k.shape, "extrapolated", dtype="<U12")
+        if rng is not None:
+            inside = (k >= rng[0]) & (k <= rng[1])
+            status[inside] = in_T
+        return status
 
     def atm_vol(self, maturity) -> float:
         """At-the-money (k = 0) implied volatility."""
@@ -506,6 +876,84 @@ class VolSurface:
         return SurfaceDiagnostics(
             fit=self.fit_report,
             arbitrage=self.check_arbitrage(**kwargs),
+        )
+
+    # ── Serialization ────────────────────────────────────────────────
+
+    def save(self, path) -> None:
+        """Write the surface to ``path`` as versioned JSON.
+
+        The schema captures everything evaluation needs — model name and
+        arbitrage condition, per-slice maturities and parameters
+        (forwards included), the flat rate, the interpolation method —
+        plus the fit report and provenance when present. Calibrating is
+        expensive and evaluating is cheap: save once, distribute, and
+        :meth:`load` reproduces evaluation exactly.
+        """
+        import json
+        from dataclasses import asdict
+
+        from .report import _pysvi_version
+
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "pysvi_version": _pysvi_version(),
+            "model": type(self.model).__name__,
+            "arbitrage_condition": int(self.model.arbitrage_condition.value),
+            "r": self.r,
+            "interp_method": self.interp_method,
+            "events": [
+                {"time": e.time, "variance": e.variance, "label": e.label}
+                for e in self.events
+            ],
+            "slices": [
+                {"maturity": T, "params": params} for T, params in self._slices
+            ],
+            "fit_report": asdict(self.fit_report) if self.fit_report else None,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+    @classmethod
+    def load(cls, path) -> "VolSurface":
+        """Reconstruct a surface saved by :meth:`save`.
+
+        Validates the schema version and model name; raises ValueError
+        on an unknown schema or model.
+        """
+        import json
+
+        from .report import SliceFitReport, SurfaceFitReport
+
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        version = payload.get("schema_version")
+        if version != _SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported surface schema_version {version!r} "
+                f"(this pysvi reads version {_SCHEMA_VERSION})"
+            )
+        model_cls = _MODEL_CLASSES.get(payload.get("model"))
+        if model_cls is None:
+            raise ValueError(f"unknown model {payload.get('model')!r} in surface file")
+        model = model_cls(
+            arbitrage_condition=ArbitrageFreedom(payload.get("arbitrage_condition", 0))
+        )
+        report = None
+        if payload.get("fit_report"):
+            raw = dict(payload["fit_report"])
+            raw["slices"] = tuple(SliceFitReport(**item) for item in raw["slices"])
+            report = SurfaceFitReport(**raw)
+        return cls(
+            model,
+            [(item["maturity"], item["params"]) for item in payload["slices"]],
+            r=payload.get("r", 0.0),
+            interp_method=payload.get("interp_method", "total_variance"),
+            fit_report=report,
+            events=[
+                VarianceEvent(e["time"], e["variance"], e.get("label", ""))
+                for e in payload.get("events", [])
+            ],
         )
 
     # ── Black-76 pricing and Greeks ──────────────────────────────────
@@ -615,6 +1063,10 @@ def calibrate_surface(
     arbitrage_condition: ArbitrageFreedom = ArbitrageFreedom.QUASI,
     r: float = 0.0,
     interp_method: str = "total_variance",
+    mode: str = "warn",
+    prior: "VolSurface" = None,
+    anchor: float = 0.0,
+    events=(),
     **model_kwargs,
 ) -> VolSurface:
     """Calendar-aware multi-expiry calibration returning a VolSurface.
@@ -660,6 +1112,7 @@ def calibrate_surface(
     -------
     VolSurface
     """
+    validate_mode(mode)
     if isinstance(model, str):
         condition = arbitrage_condition
         if enforce_calendar:
@@ -702,45 +1155,76 @@ def calibrate_surface(
     if not groups:
         raise ValueError("calibrate_surface: empty input panel")
 
+    events = tuple(
+        (e if isinstance(e, VarianceEvent) else VarianceEvent(*e))
+        for e in events
+    )
     prepared = []
     slice_reports = []
     for T, g in groups:
-        k_i, w_i, F_i = prepare_slice(g)
-        if k_i is None:
-            logger.warning(
-                f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
-            )
+        k_i, w_i, F_i, sel_i = prepare_slice(g, return_index=True)
+        if k_i is not None:
+            w_i = _subtract_events(w_i, events, T, mode)
+        if k_i is None or w_i is None:
+            if mode == "strict":
+                raise ValueError(
+                    f"calibrate_surface(mode='strict'): slice T={T:g} has "
+                    f"insufficient data ({len(g)} quotes before cleaning)"
+                )
+            if mode == "warn":
+                logger.warning(
+                    f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
+                )
             slice_reports.append(
                 build_slice_report(T, SLICE_INSUFFICIENT, len(g))
             )
             continue
-        prepared.append((T, g, k_i, w_i, F_i))
+        prepared.append((T, g, k_i, w_i, F_i, sel_i))
     if not prepared:
         raise ValueError("calibrate_surface: no usable slice in the panel")
 
-    theta_by_T, theta_ref = _data_thetas(instance, (item[:2] for item in prepared))
+    theta_by_T, theta_ref = _data_thetas(
+        instance, (item[:2] for item in prepared), events
+    )
     if enforce_calendar and theta_by_T:
         ordered_T = [item[0] for item in prepared]
         raw = np.array([theta_by_T[T] for T in ordered_T])
         monotone = np.maximum.accumulate(raw)
         if np.any(monotone > raw):
-            logger.warning(
-                "calibrate_surface: per-slice ATM total variances were not "
-                "non-decreasing; clipped upward to enforce a monotone theta(T)"
-            )
+            if mode == "strict":
+                bad_T = [f"{T:g}" for T, r_i, m_i in
+                         zip(ordered_T, raw, monotone) if m_i > r_i]
+                raise ValueError(
+                    "calibrate_surface(mode='strict'): per-slice ATM total "
+                    "variances are not non-decreasing (calendar-arbitrageable "
+                    f"ATM term structure) at T = {', '.join(bad_T)}"
+                )
+            if mode == "warn":
+                logger.warning(
+                    "calibrate_surface: per-slice ATM total variances were not "
+                    "non-decreasing; clipped upward to enforce a monotone theta(T)"
+                )
         theta_by_T = dict(zip(ordered_T, (float(x) for x in monotone)))
 
     if isinstance(instance, ESSVI):
+        if prior is not None and mode == "warn":
+            logger.warning(
+                "calibrate_surface: prior/anchor are not supported in the "
+                "joint eSSVI fit yet; fitting unanchored"
+            )
         slices = _calibrate_essvi_global(
             instance, prepared, theta_by_T, theta_ref, enforce_calendar, model_kwargs
         )
     else:
         slices = []
         prev_params = None
-        for T, g, k_i, w_i, F_i in prepared:
+        for T, g, k_i, w_i, F_i, sel_i in prepared:
             kwargs = _auto_slice_kwargs(
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
+            _band_kwargs(g, T, k_i, w_i, sel_i, kwargs)
+            _shift_band_events(kwargs, events, T)
+            _prior_slice_kwargs(prior, anchor, T, kwargs)
             if enforce_calendar and prev_params is not None:
                 grid = _penalty_grid(k_i)
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
@@ -759,15 +1243,24 @@ def calibrate_surface(
                 # 'no slice calibrated successfully'
                 raise
             except Exception as exc:  # noqa: BLE001 -- contract: skip + record
-                logger.warning(
-                    f"calibrate_surface: slice T={T:g} raised "
-                    f"{type(exc).__name__}: {exc}; skipping"
-                )
+                if mode == "strict":
+                    raise
+                if mode == "warn":
+                    logger.warning(
+                        f"calibrate_surface: slice T={T:g} raised "
+                        f"{type(exc).__name__}: {exc}; skipping"
+                    )
                 params = None
             if params is None:
-                logger.warning(
-                    f"calibrate_surface: slice T={T:g} failed to calibrate; skipping"
-                )
+                if mode == "strict":
+                    raise ValueError(
+                        f"calibrate_surface(mode='strict'): slice T={T:g} "
+                        "failed to calibrate"
+                    )
+                if mode == "warn":
+                    logger.warning(
+                        f"calibrate_surface: slice T={T:g} failed to calibrate; skipping"
+                    )
                 continue
             params["forward"] = F_i
             slices.append((T, params))
@@ -775,11 +1268,11 @@ def calibrate_surface(
     if not slices:
         raise ValueError("calibrate_surface: no slice calibrated successfully")
 
-    if isinstance(instance, (SSVI, ESSVI)):
+    if isinstance(instance, (SSVI, ESSVI)) and mode != "lenient":
         _warn_ssvi_admissibility(slices)
 
     params_by_T = dict(slices)
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         if T in params_by_T:
             w_fit = instance.total_variance(k_i, params_by_T[T])
             slice_reports.append(build_slice_report(
@@ -795,7 +1288,7 @@ def calibrate_surface(
         calendar_enforced=enforce_calendar,
     )
     return VolSurface(instance, slices, r=r, interp_method=interp_method,
-                      fit_report=report)
+                      fit_report=report, events=events)
 
 
 def _calibrate_essvi_global(
@@ -810,7 +1303,7 @@ def _calibrate_essvi_global(
     init = _initialization(model_kwargs)
 
     ctx = []
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(
             k_i, w_i, model_kwargs
         )

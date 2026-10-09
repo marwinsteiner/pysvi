@@ -393,6 +393,19 @@ wheels = [
 ]
 
 [[package]]
+name = "interest-rate-models"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/70/90/b8abd40fb8a3f67e0a1f379bd4c324f5d4818930c4f87d27a800425eb863/interest_rate_models-0.1.0.tar.gz", hash = "sha256:db818468266421e06f1f60f81f988ce72d31f42a8d473fe025c9bd1bd2fc1c77", size = 80258, upload-time = "2026-07-30T10:43:07.384Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/68/47fbfbd82a539fbcba4187df8d662ddd910444fd5b5aad02d8bdb8bfb942/interest_rate_models-0.1.0-py3-none-any.whl", hash = "sha256:d3e5c47d591ce5f74c7697d5b84225376ad8fdaa94262a670ef6619c73fc6e24", size = 33854, upload-time = "2026-07-30T10:43:06.114Z" },
+]
+
+[[package]]
 name = "jaraco-classes"
 version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1376,6 +1389,7 @@ wheels = [
 name = "svi-py"
 source = { editable = "." }
 dependencies = [
+    { name = "interest-rate-models" },
     { name = "loguru" },
     { name = "numpy" },
     { name = "pandas" },
@@ -1409,6 +1423,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "interest-rate-models", specifier = ">=0.1.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "numba", marker = "extra == 'numba'", specifier = ">=0.67" },
     { name = "numpy", specifier = ">=2.4.2" },
