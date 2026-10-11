@@ -16,7 +16,7 @@ surface = VolSurface.fit(df, model="svi", r=0.02)
 surface = VolSurface.fit(df, model="ssvi", loss="soft_l1", initialization="multi_start")
 ```
 
-Slices that fail to calibrate are skipped with a warning. A surface can also be assembled directly from calibrated slices: `VolSurface(model, {T: params, ...})`, where each params dict carries `'forward'` (as `calibrate_slice` returns).
+With `objective="bid_ask"`, panels carrying `iv_bid`/`iv_ask` columns (as `OptionChain` produces) get their per-slice `w_bid`/`w_ask` bands derived automatically — rows with a missing or crossed band degenerate to fit-to-mid. Slices that fail to calibrate are skipped with a warning. A surface can also be assembled directly from calibrated slices: `VolSurface(model, {T: params, ...})`, where each params dict carries `'forward'` (as `calibrate_slice` returns).
 
 ## Calendar-aware fitting
 

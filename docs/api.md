@@ -25,6 +25,14 @@
    :show-inheritance:
 ```
 
+## Chain ingestion
+
+```{eval-rst}
+.. automodule:: pysvi.chain
+   :members:
+   :show-inheritance:
+```
+
 ## Reports
 
 ```{eval-rst}

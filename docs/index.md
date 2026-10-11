@@ -27,6 +27,8 @@ Requires Python >= 3.13.
 :caption: Contents
 
 quickstart
+example
+examples
 surface
 models/index
 arbitrage

@@ -35,7 +35,8 @@ from scipy.special import ndtr
 
 from . import _kernels
 from .models import (
-    ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, Parametrization, SABR, SSVI,
+    ArbitrageFreedom, DirectSVI, ESSVI, JumpWings, NaturalSVI, Parametrization,
+    SABR, SSVI, SVI,
     _initialization, _mad_scale, _minimize_with_starts, _multistart_variants,
     _penalty_grid, _prepare_loss_inputs, essvi_total_variance,
 )
@@ -49,6 +50,14 @@ from .report import (
 
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
 _INTERP_METHODS = ("total_variance", "theta")
+
+#: Serialization schema version written by VolSurface.save.
+_SCHEMA_VERSION = 1
+
+_MODEL_CLASSES = {
+    cls.__name__: cls
+    for cls in (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR)
+}
 
 
 def _npdf(x):
@@ -84,6 +93,31 @@ def _atm_theta(g) -> float:
         return float(np.nanmin(g["iv"] ** 2 * g["maturity"]))
     order = np.argsort(k)
     return float(np.interp(0.0, k[order], w[order]))
+
+
+def _band_kwargs(g, T, k, w, sel, kwargs) -> None:
+    """Derive per-slice w_bid/w_ask for the bid_ask objective from the
+    panel's iv_bid/iv_ask columns (as OptionChain produces), filtered
+    exactly like the quotes. Rows whose band is missing or crossed
+    degenerate to a zero-width band at the mid (fit-to-mid there).
+    Explicit w_bid/w_ask kwargs win; absent columns leave the kwargs
+    untouched (the model then raises its usual requirement error).
+    """
+    if kwargs.get("objective") != "bid_ask":
+        return
+    if "w_bid" in kwargs or "w_ask" in kwargs:
+        return
+    if not ("iv_bid" in g.columns and "iv_ask" in g.columns):
+        return
+    iv_bid = g["iv_bid"].to_numpy(dtype=float)[sel]
+    iv_ask = g["iv_ask"].to_numpy(dtype=float)[sel]
+    w_bid = iv_bid ** 2 * T
+    w_ask = iv_ask ** 2 * T
+    bad = ~np.isfinite(w_bid) | ~np.isfinite(w_ask) | (w_bid > w_ask)
+    w_bid[bad] = w[bad]
+    w_ask[bad] = w[bad]
+    kwargs["w_bid"] = w_bid
+    kwargs["w_ask"] = w_ask
 
 
 def _auto_slice_kwargs(instance, T, df_slice, model_kwargs, theta_by_T, theta_ref):
@@ -265,7 +299,7 @@ class VolSurface:
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
             n_quotes = len(g)
-            k, w, F = prepare_slice(g)
+            k, w, F, sel = prepare_slice(g, return_index=True)
             if k is None:
                 logger.warning(
                     f"VolSurface.fit: slice T={T:g} has insufficient data; skipping"
@@ -274,6 +308,7 @@ class VolSurface:
                     build_slice_report(T, SLICE_INSUFFICIENT, n_quotes)
                 )
                 continue
+            _band_kwargs(g, T, k, w, sel, kwargs)
             try:
                 params = instance.calibrate(k, w, **kwargs)
             except np.linalg.LinAlgError as exc:
@@ -508,6 +543,76 @@ class VolSurface:
             arbitrage=self.check_arbitrage(**kwargs),
         )
 
+    # ── Serialization ────────────────────────────────────────────────
+
+    def save(self, path) -> None:
+        """Write the surface to ``path`` as versioned JSON.
+
+        The schema captures everything evaluation needs — model name and
+        arbitrage condition, per-slice maturities and parameters
+        (forwards included), the flat rate, the interpolation method —
+        plus the fit report and provenance when present. Calibrating is
+        expensive and evaluating is cheap: save once, distribute, and
+        :meth:`load` reproduces evaluation exactly.
+        """
+        import json
+        from dataclasses import asdict
+
+        from .report import _pysvi_version
+
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "pysvi_version": _pysvi_version(),
+            "model": type(self.model).__name__,
+            "arbitrage_condition": int(self.model.arbitrage_condition.value),
+            "r": self.r,
+            "interp_method": self.interp_method,
+            "slices": [
+                {"maturity": T, "params": params} for T, params in self._slices
+            ],
+            "fit_report": asdict(self.fit_report) if self.fit_report else None,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+    @classmethod
+    def load(cls, path) -> "VolSurface":
+        """Reconstruct a surface saved by :meth:`save`.
+
+        Validates the schema version and model name; raises ValueError
+        on an unknown schema or model.
+        """
+        import json
+
+        from .report import SliceFitReport, SurfaceFitReport
+
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        version = payload.get("schema_version")
+        if version != _SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported surface schema_version {version!r} "
+                f"(this pysvi reads version {_SCHEMA_VERSION})"
+            )
+        model_cls = _MODEL_CLASSES.get(payload.get("model"))
+        if model_cls is None:
+            raise ValueError(f"unknown model {payload.get('model')!r} in surface file")
+        model = model_cls(
+            arbitrage_condition=ArbitrageFreedom(payload.get("arbitrage_condition", 0))
+        )
+        report = None
+        if payload.get("fit_report"):
+            raw = dict(payload["fit_report"])
+            raw["slices"] = tuple(SliceFitReport(**item) for item in raw["slices"])
+            report = SurfaceFitReport(**raw)
+        return cls(
+            model,
+            [(item["maturity"], item["params"]) for item in payload["slices"]],
+            r=payload.get("r", 0.0),
+            interp_method=payload.get("interp_method", "total_variance"),
+            fit_report=report,
+        )
+
     # ── Black-76 pricing and Greeks ──────────────────────────────────
 
     def _black_inputs(self, strike, maturity):
@@ -705,7 +810,7 @@ def calibrate_surface(
     prepared = []
     slice_reports = []
     for T, g in groups:
-        k_i, w_i, F_i = prepare_slice(g)
+        k_i, w_i, F_i, sel_i = prepare_slice(g, return_index=True)
         if k_i is None:
             logger.warning(
                 f"calibrate_surface: slice T={T:g} has insufficient data; skipping"
@@ -714,7 +819,7 @@ def calibrate_surface(
                 build_slice_report(T, SLICE_INSUFFICIENT, len(g))
             )
             continue
-        prepared.append((T, g, k_i, w_i, F_i))
+        prepared.append((T, g, k_i, w_i, F_i, sel_i))
     if not prepared:
         raise ValueError("calibrate_surface: no usable slice in the panel")
 
@@ -737,10 +842,11 @@ def calibrate_surface(
     else:
         slices = []
         prev_params = None
-        for T, g, k_i, w_i, F_i in prepared:
+        for T, g, k_i, w_i, F_i, sel_i in prepared:
             kwargs = _auto_slice_kwargs(
                 instance, T, g, model_kwargs, theta_by_T, theta_ref
             )
+            _band_kwargs(g, T, k_i, w_i, sel_i, kwargs)
             if enforce_calendar and prev_params is not None:
                 grid = _penalty_grid(k_i)
                 kwargs["w_prev"] = instance.total_variance(grid, prev_params)
@@ -779,7 +885,7 @@ def calibrate_surface(
         _warn_ssvi_admissibility(slices)
 
     params_by_T = dict(slices)
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         if T in params_by_T:
             w_fit = instance.total_variance(k_i, params_by_T[T])
             slice_reports.append(build_slice_report(
@@ -810,7 +916,7 @@ def _calibrate_essvi_global(
     init = _initialization(model_kwargs)
 
     ctx = []
-    for T, g, k_i, w_i, F_i in prepared:
+    for T, g, k_i, w_i, F_i, _sel in prepared:
         mode, loss_code, weights, w_lo, w_hi = _prepare_loss_inputs(
             k_i, w_i, model_kwargs
         )

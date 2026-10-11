@@ -44,6 +44,10 @@ print(fitted[["strike", "iv", "fitted_iv", "residual_iv"]])
 
 The factory accepts `"svi"`, `"natural"` (or `"nsvi"`), `"ssvi"`, `"essvi"`, `"jumpwings"` (or `"jw"`), `"directsvi"` (or `"dsvi"`), and `"sabr"`. Some models take extra per-slice arguments (`theta` for SSVI/eSSVI, `T` for jump-wings, `T`/`F`/`beta` for SABR) — see the [documentation](https://pysvi.readthedocs.io) for each parametrization's formulas, parameters, and usage, plus arbitrage-constraint options and the input-preparation helpers.
 
+## Examples
+
+The [`examples/`](https://github.com/marwinsteiner/pysvi/tree/main/examples) directory walks a **real SPY option chain** (fetched via yfinance) from raw quotes to a priced, verified, serialized surface — five runnable scripts exercising the complete public API, including the no-lookahead snapshot discipline and a survey of implied-vol inversion methods. See the [examples guide](https://pysvi.readthedocs.io/en/latest/examples.html).
+
 ## Contributing
 
 Contributions, bug reports, and feature requests are welcome. Open an issue or submit a PR on [GitHub](https://github.com/marwinsteiner/pysvi). See the [contributing guide](https://pysvi.readthedocs.io/en/latest/contributing.html).
