@@ -85,5 +85,14 @@ jobs:
 
           gh workflow run python-publish.yml --repo "$REPO" --ref "$MS_TITLE"
 
+          # Close every open issue on the shipped milestone (belt and braces:
+          # PR-body "Closes #N" keywords have not fired reliably on bot merges)
+          for ISSUE in $(gh issue list --repo "$REPO" --milestone "$MS_TITLE" \
+              --state open --json number --jq '.[].number'); do
+            gh issue close "$ISSUE" --repo "$REPO" --reason completed \
+              --comment "Shipped in $MS_TITLE (PR #$PR)."
+            echo "Closed issue #$ISSUE (milestone $MS_TITLE)"
+          done
+
           gh api -X PATCH "repos/$REPO/milestones/$MS_NUMBER" -f state=closed
           echo "Released $MS_TITLE from PR #$PR and dispatched the deploy pipeline."
