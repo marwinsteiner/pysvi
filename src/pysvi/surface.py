@@ -77,6 +77,29 @@ def _is_call(cp: str) -> bool:
     raise ValueError(f"cp must be 'call' or 'put', got {cp!r}")
 
 
+#: Smile-dynamics conventions accepted by the Greeks (Derman 1999).
+_STICKY = ("strike", "delta")
+
+
+def _check_sticky(sticky: str) -> str:
+    """Validate a smile-dynamics convention.
+
+    ``"strike"``: implied vol fixed per strike (range-bound regime).
+    ``"delta"``: implied vol fixed per log-moneyness -- the smile floats
+    with the forward (trending regime). Derman's third regime, the
+    sticky implied tree, needs a local-vol hedge ratio and is reserved
+    as ``"local_vol"`` (not implemented yet).
+    """
+    if sticky == "local_vol":
+        raise NotImplementedError(
+            "sticky='local_vol' (Derman's sticky-implied-tree regime) is "
+            "reserved but not implemented yet; use 'strike' or 'delta'"
+        )
+    if sticky not in _STICKY:
+        raise ValueError(f"unknown sticky {sticky!r}; choose from {_STICKY}")
+    return sticky
+
+
 def _shape_like(values, original):
     """Return a float for scalar input, the array otherwise."""
     return float(values[0]) if np.ndim(original) == 0 else values
@@ -763,6 +786,78 @@ class VolSurface:
         values = self._pchip(k_arr).derivative()(T)
         return _shape_like(values, k)
 
+    # ── Dupire local volatility ──────────────────────────────────────
+
+    def local_variance(self, k, maturity, return_n_invalid: bool = False):
+        """Dupire local variance at log-moneyness ``k`` (Gatheral's
+        total-variance form)::
+
+            sigma_loc^2(k, T) = (dw/dT) / g(k)
+            g = 1 - (k/w) w' + 1/4 (-1/4 - 1/w + k^2/w^2) w'^2 + 1/2 w''
+
+        with w' = dw/dk, w'' = d2w/dk2 at maturity T. The denominator
+        is exactly the risk-neutral density factor g(k) of the butterfly
+        diagnostics, so local variance is defined precisely where the
+        slice is butterfly-free; a negative numerator is a calendar
+        violation. Both regions return NaN -- never a negative or
+        imaginary variance -- and ``return_n_invalid=True`` also returns
+        how many points were invalid.
+
+        Requires a C1 surface (``interp_method="monotone_cubic"``): the
+        C0 methods' dw/dT jumps at every fitted slice. With variance
+        events, the numerator is the continuous component's dw/dT (an
+        event is a jump in w, not a rate) and the denominator sees the
+        full total variance. Wings beyond the quoted strike range
+        inherit the model's extrapolation, not market information (see
+        ``iv(..., return_status=True)``).
+        """
+        if self.regularity != "C1":
+            raise ValueError(
+                f"local volatility requires a C1 maturity interpolation; "
+                f"this surface uses interp_method={self.interp_method!r} "
+                f"(regularity {self.regularity}). Refit or construct with "
+                "interp_method='monotone_cubic'."
+            )
+        T = float(maturity)
+        k_arr = np.atleast_1d(np.asarray(k, dtype=np.float64))
+        w = self._w_at(k_arr, T)
+        w1 = self._dw_at(k_arr, T)
+        w2 = self._dw_at(k_arr, T, second=True)
+        w_T = np.atleast_1d(self.dw_dT(k_arr, T))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g = (
+                1.0 - k_arr * w1 / w
+                + 0.25 * (-0.25 - 1.0 / w + k_arr * k_arr / (w * w)) * w1 * w1
+                + 0.5 * w2
+            )
+            lv = w_T / g
+        valid = (
+            np.isfinite(lv) & np.isfinite(g) & (w > 0.0) & (g > 0.0) & (w_T >= 0.0)
+        )
+        out = np.where(valid, lv, np.nan)
+        result = _shape_like(out, k)
+        if return_n_invalid:
+            return result, int(np.sum(~valid))
+        return result
+
+    def local_vol(self, strike, maturity, return_n_invalid: bool = False):
+        """Dupire local volatility at absolute strike(s), sqrt of
+        :meth:`local_variance` at k = log(K / F(T)). NaN where the surface
+        violates butterfly or calendar conditions; see
+        :meth:`local_variance` for the formula, requirements and caveats.
+        """
+        T = float(maturity)
+        K = np.atleast_1d(np.asarray(strike, dtype=np.float64))
+        if np.any(K <= 0):
+            raise ValueError("strikes must be positive")
+        k = np.log(K / self.forward(T))
+        lv, n_bad = self.local_variance(k, T, return_n_invalid=True)
+        vol = np.sqrt(np.atleast_1d(lv))
+        result = _shape_like(vol, strike)
+        if return_n_invalid:
+            return result, n_bad
+        return result
+
     def total_variance(self, k, maturity):
         """Total variance w(k) at any maturity in the fitted range."""
         values = self._w_at(np.atleast_1d(np.asarray(k, dtype=np.float64)), maturity)
@@ -991,21 +1086,75 @@ class VolSurface:
             value = disc * (K * ndtr(-d2) - F * ndtr(-d1))
         return _shape_like(value, strike)
 
-    def delta(self, strike, maturity, cp: str = "call"):
-        """Black-76 forward delta, e^{-rT} N(d1) (call) or -e^{-rT} N(-d1) (put).
+    def _smile_slopes(self, strike, maturity):
+        """sigma, d sigma/dk and d2 sigma/dk2 at the strikes' log-moneyness,
+        from the surface's w, w', w'' (sigma = sqrt(w / T))."""
+        T = float(maturity)
+        K = np.atleast_1d(np.asarray(strike, dtype=np.float64))
+        k = np.log(K / self.forward(T))
+        w = np.maximum(self._w_at(k, T), 1e-16)
+        w1 = self._dw_at(k, T)
+        w2 = self._dw_at(k, T, second=True)
+        sigma = np.sqrt(w / T)
+        s_k = w1 / (2.0 * sigma * T)
+        s_kk = w2 / (2.0 * sigma * T) - w1 * w1 / (4.0 * sigma ** 3 * T * T)
+        return sigma, s_k, s_kk
 
-        Holds the implied volatility fixed (sticky-strike).
+    def delta(self, strike, maturity, cp: str = "call", sticky: str = "strike"):
+        """Black-76 forward delta under a smile-dynamics convention.
+
+        ``sticky="strike"`` (default): the implied vol at each strike
+        stays put as the forward moves -- e^{-rT} N(d1) (call) or
+        -e^{-rT} N(-d1) (put).
+
+        ``sticky="delta"``: the smile floats with the forward (implied
+        vol fixed per log-moneyness k = log(K/F), Derman's sticky-delta
+        / sticky-moneyness regime). Delta gains the smile-slope term::
+
+            delta_sd = delta_ss - vega * (d sigma/dk) / F
+
+        so with a negative skew the call delta EXCEEDS the sticky-strike
+        delta. Derman's third regime (sticky implied tree) is reserved
+        as ``sticky="local_vol"``.
         """
+        mode = _check_sticky(sticky)
         is_call = _is_call(cp)
         T, F, K, sqrt_w, d1, _ = self._black_inputs(strike, maturity)
         disc = np.exp(-self.r * T)
         value = disc * ndtr(d1) if is_call else -disc * ndtr(-d1)
+        if mode == "delta":
+            _, s_k, _ = self._smile_slopes(strike, maturity)
+            vega = disc * F * _npdf(d1) * np.sqrt(T)
+            value = value - vega * s_k / F
         return _shape_like(value, strike)
 
-    def gamma(self, strike, maturity):
-        """Black-76 gamma, e^{-rT} phi(d1) / (F sqrt(w)). Same for calls and puts."""
-        T, F, K, sqrt_w, d1, _ = self._black_inputs(strike, maturity)
-        value = np.exp(-self.r * T) * _npdf(d1) / (F * sqrt_w)
+    def gamma(self, strike, maturity, sticky: str = "strike"):
+        """Black-76 gamma under a smile-dynamics convention (same for
+        calls and puts).
+
+        ``sticky="strike"``: e^{-rT} phi(d1) / (F sqrt(w)).
+
+        ``sticky="delta"``: the full second derivative of the price with
+        the smile floating in log-moneyness, sigma = sigma(log(K/F))::
+
+            Gamma_sd = B_FF + 2 B_Fs s_F + B_ss s_F^2 + B_s s_FF
+            s_F = -sigma_k / F,  s_FF = (sigma_k + sigma_kk) / F^2
+
+        with the Black-76 partials B_FF (gamma), B_Fs (vanna), B_ss
+        (volga), B_s (vega).
+        """
+        mode = _check_sticky(sticky)
+        T, F, K, sqrt_w, d1, d2 = self._black_inputs(strike, maturity)
+        disc = np.exp(-self.r * T)
+        value = disc * _npdf(d1) / (F * sqrt_w)
+        if mode == "delta":
+            sigma, s_k, s_kk = self._smile_slopes(strike, maturity)
+            vega = disc * F * _npdf(d1) * np.sqrt(T)
+            vanna = -disc * _npdf(d1) * d2 / sigma
+            volga = vega * d1 * d2 / sigma
+            s_F = -s_k / F
+            s_FF = (s_k + s_kk) / (F * F)
+            value = value + 2.0 * vanna * s_F + volga * s_F * s_F + vega * s_FF
         return _shape_like(value, strike)
 
     def vega(self, strike, maturity):
@@ -1014,13 +1163,18 @@ class VolSurface:
         value = np.exp(-self.r * T) * F * _npdf(d1) * np.sqrt(T)
         return _shape_like(value, strike)
 
-    def theta(self, strike, maturity, cp: str = "call"):
+    def theta(self, strike, maturity, cp: str = "call", sticky: str = "strike"):
         """Black-76 theta per year of calendar time, holding sigma fixed.
 
         ::
 
             theta = r V - e^{-rT} F phi(d1) sigma / (2 sqrt(T))
+
+        Theta holds the forward fixed, so the strike and log-moneyness
+        coincide and the sticky-strike and sticky-delta conventions give
+        the same number; ``sticky`` is accepted for a uniform Greek API.
         """
+        _check_sticky(sticky)
         T, F, K, sqrt_w, d1, _ = self._black_inputs(strike, maturity)
         decay = np.exp(-self.r * T) * F * _npdf(d1) * sqrt_w / (2.0 * T)
         value = self.r * np.atleast_1d(self.price(strike, maturity, cp)) - decay
