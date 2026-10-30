@@ -37,16 +37,20 @@ def load_snapshot(name: str = "spy_chain_latest"):
 
 
 def term_structure(meta):
-    """Continuously compounded zero rate r(T) from the snapshot's curve.
+    """The snapshot's Treasury curve as an ``irm.DiscountCurve``.
 
-    Script 01 fits a real four-pillar Treasury curve (13w/5y/10y/30y)
-    with the interest-rate-models package (log-linear discount-factor
-    interpolation via ``irm.DiscountCurve``) and persists it densely in
-    the metadata, so this reconstruction needs neither the network nor
-    the extra dependency -- and, like everything else, uses only data
-    observable at the snapshot timestamp.
+    Script 01 fits a real four-pillar curve (13w/5y/10y/30y) with
+    interest-rate-models -- a core dependency of svi-py -- and persists
+    it densely in the metadata; this rebuilds the same DiscountCurve
+    from the stored grid, so every reconstruction uses only data
+    observable at the snapshot timestamp. The returned object can be
+    passed directly wherever svi-py takes a rate (its ``zero_rate`` is
+    the r(T) accessor).
     """
+    import interest_rate_models as irm
+
     zc = meta["zero_curve"]
-    times = np.asarray(zc["times"], dtype=float)
-    rates = np.asarray(zc["rates"], dtype=float)
-    return lambda T: float(np.interp(T, times, rates))
+    return irm.DiscountCurve.from_zero_rates(
+        np.asarray(zc["times"], dtype=float),
+        np.asarray(zc["rates"], dtype=float),
+    )

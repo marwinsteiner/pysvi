@@ -80,3 +80,15 @@ w_prev = model.total_variance(k_grid, params_first_slice)
 # Calibrate the next slice with calendar constraint:
 params_next = model.calibrate(k, w_target, w_prev=w_prev)
 ```
+
+
+## Economic vs mathematical arbitrage
+
+The diagnostics report mathematical evidence (minimum density, Lee slopes, calendar margins). `classify_arbitrage(surface, panel=...)` adds the economic layer — what that evidence *means*:
+
+- **`extrapolation_risk`** — the violation sits outside the slice's quoted strike range: a property of the model's wings, not a constructible trade.
+- **`executable`** — inside the quoted range *and* a static butterfly built from the panel's bid/ask quotes around the violation has negative worst-case cost (buy the wings at ask, sell the body at bid): an actual arbitrage at quoted prices.
+- **`quote_consistent`** — inside the quoted range, but the worst-case butterfly cost is non-negative: the violation lives within bid/ask uncertainty.
+- **`mathematical`** — inside the quoted range with no bid/ask panel supplied to decide executability.
+
+A tiny violation in an untradeable wing is not an executable arbitrage, and the classification keeps the two from being conflated in reports.

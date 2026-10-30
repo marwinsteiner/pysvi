@@ -4,7 +4,6 @@ High-level calibration pipeline for IV surfaces from option panels.
 Supports SVI, SSVI, eSSVI via models.Parametrization classes.
 """
 
-import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import re
@@ -13,7 +12,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from numpy.typing import NDArray
-from py_lets_be_rational.exceptions import BelowIntrinsicException
+from py_lets_be_rational.exceptions import (AboveMaximumException,
+                                             BelowIntrinsicException)
 from py_vollib.black_scholes_merton.implied_volatility import (
     implied_volatility as bsm_iv,
 )
@@ -21,15 +21,34 @@ from py_vollib.black_scholes_merton.implied_volatility import (
 from .models import (SVI, NaturalSVI, SSVI, ESSVI, JumpWings, DirectSVI, SABR,
                      Parametrization, ArbitrageFreedom)
 
-warnings.filterwarnings("ignore")
 
 def _rate_at(rate, tte):
-    """Resolve a flat float or callable term structure rate(T) on times tte.
+    """Resolve a rate specification to zero rates r(T) on times tte.
 
-    Accepts a float (flat, unchanged behaviour) or a callable T -> rate
-    (continuously compounded zero rate to T). Vectorized over array-like
-    tte for callables.
+    Every rate input in the library goes through here, so users can
+    express a view of interest rates in whichever form fits:
+
+    * a float -- flat continuously compounded rate (unchanged behaviour);
+    * an ``interest_rate_models.DiscountCurve`` (or any object with
+      vectorized ``zero_rate(t)`` and ``discount(t)``) -- a fitted
+      market curve;
+    * an interest-rate model from ``interest_rate_models`` (any object
+      with ``bond_price``/``zero_rate(t, T)``) -- the model's implied
+      zero curve from today, ``zero_rate(0, T)``;
+    * any callable T -> r(T) -- e.g. a ``scipy.interpolate.CubicSpline``
+      over curve pillars, or a lambda.
+
+    Vectorized over array-like tte in all cases.
     """
+    if hasattr(rate, "zero_rate"):
+        arr = np.asarray(tte, dtype=float)
+        if hasattr(rate, "discount"):
+            # DiscountCurve-like: vectorized one-argument zero_rate(t)
+            flat = np.asarray(rate.zero_rate(arr), dtype=float)
+            return flat.reshape(arr.shape)
+        # interest-rate model: zero rate from today to each maturity
+        flat = np.array([float(rate.zero_rate(0.0, t)) for t in np.ravel(arr)])
+        return flat.reshape(arr.shape)
     if callable(rate):
         arr = np.asarray(tte, dtype=float)
         flat = np.array([float(rate(t)) for t in np.ravel(arr)])
@@ -124,10 +143,13 @@ def compute_ivs_vectorized(
                     float(ttes[i]),
                     r,
                     q,
-                    str(flags[i]).lower(),
+                    str(flags[i]).lower()[:1],  # 'call'/'put' -> 'c'/'p'
                 )
             )
-        except (BelowIntrinsicException, Exception):
+        except (BelowIntrinsicException, AboveMaximumException, ValueError,
+                KeyError, ZeroDivisionError, OverflowError):
+            # NaN-per-row contract: a bad row (unrecognized flag,
+            # uninvertible price) never aborts the batch.
             ivs[i] = np.nan
     return ivs
 
@@ -153,9 +175,10 @@ def calculate_implied_forward(
         Underlying spot price time series.
     tte : pd.Series
         Time-to-expiry (years) for this expiry.
-    r : float or callable
-        Continuously compounded risk-free rate: a flat float, or a
-        callable T -> r(T) for a term structure.
+    r : float, curve, model, or callable
+        Continuously compounded risk-free rate in any form _rate_at
+        accepts: flat float, ``interest_rate_models.DiscountCurve``,
+        an interest-rate model, or a callable T -> r(T).
     strike : pd.Series
         Fixed strike (same value across series).
     call_mid : pd.Series
@@ -185,11 +208,18 @@ def calculate_implied_forward(
     1    101.26
     dtype: float64
     """
-    r_t = _rate_at(r, tte)
-    fwd = strike + np.exp(r_t * tte.astype(float).to_numpy()) * (
+    # Mask BEFORE evaluating the rate view: curve and model objects
+    # raise on non-positive times, where the float path just NaN'd the
+    # row -- invalid rows must stay NaN under every rate form.
+    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
+    tte_arr = tte.astype(float).to_numpy()
+    m = mask.to_numpy()
+    r_t = np.zeros(tte_arr.shape)
+    if m.any():
+        r_t[m] = np.asarray(_rate_at(r, tte_arr[m]), dtype=float)
+    fwd = strike + np.exp(r_t * tte_arr) * (
         call_mid.astype(float) - put_mid.astype(float)
     )
-    mask = (spot > 0) & (tte > 0) & (strike > 0) & call_mid.notna() & put_mid.notna()
     return fwd.where(mask, np.nan)
 
 
