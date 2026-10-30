@@ -26,7 +26,7 @@ OUT = Path(__file__).parent / "data"
 def main() -> None:
     df, meta = load_snapshot()
     spot, r_flat = meta["spot"], meta["r_13w_cc"]
-    r_curve = term_structure(meta)
+    curve = term_structure(meta)             # irm.DiscountCurve
 
     # ── OptionChain: raw quotes in, calibration panel out ────────────
     # Column names are configurable (here the snapshot already uses
@@ -43,13 +43,29 @@ def main() -> None:
         bid="bid",
         ask="ask",
         spot=spot,
-        rate=r_curve,             # term-structure callable
+        rate=curve,               # the irm curve object, directly
         dividend_yield=0.012,     # used only by the spot fallback
     )
     panel = chain.panel           # calibrate_slice schema + iv_bid/iv_ask
     print(f"chain: {len(panel)} options, maturities "
           f"{[round(T, 3) for T in chain.maturities]}")
     print(f"panel columns: {list(panel.columns)}")
+
+    # ── Failure semantics: strict / warn / lenient ───────────────────
+    # Nothing disappears silently: every mode records rejected quotes,
+    # failed inversions, and skipped expiries on chain.rejections, and
+    # fit() carries the counts onto the surface's fit report. strict
+    # raises on the first bad input with its location; lenient filters
+    # without logging. Demonstrate strict on a deliberately bad quote:
+    print(f"ingestion accounting: {chain.rejections}")
+    corrupted = df.copy()
+    corrupted.loc[corrupted.index[0], ["bid", "ask"]] = [5.0, 4.0]  # crossed
+    try:
+        OptionChain.from_dataframe(corrupted, strike="strike", expiry="expiry",
+                                   cp="cp", bid="bid", ask="ask",
+                                   rate=r_flat, mode="strict")
+    except ValueError as err:
+        print(f"mode='strict' raised as designed: {str(err)[:70]}...")
 
     # ── Route 1: chain.fit -- independent slices ─────────────────────
     surface = chain.fit(
@@ -134,6 +150,28 @@ def main() -> None:
     assert np.array_equal(loaded.iv(K, T_mid), surface.iv(K, T_mid))
     print(f"\nsaved -> {path.name}; load() round-trips evaluation exactly "
           f"(pysvi {loaded.fit_report.pysvi_version})")
+
+    # ── Differentiability: C1 maturity interpolation ─────────────────
+    # The default total-variance blend is continuous but its maturity
+    # derivative jumps at every fitted slice (regularity "C0"): fine
+    # for prices and IVs, wrong for anything consuming dw/dT (Dupire
+    # local vol, forward variance). interp_method="monotone_cubic" is
+    # a shape-preserving cubic in T -- C1, exact at fitted maturities,
+    # calendar-monotone -- and unlocks the dw_dT accessor.
+    c1 = VolSurface.fit(
+        panel, model="svi", r=r_flat,
+        interp_method="monotone_cubic", initialization="multi_start",
+    )
+    print(f"\nregularity: default={surface.regularity}, "
+          f"monotone_cubic={c1.regularity}")
+    print(f"dw_dT(ATM, T={T_mid:.3f}) = {c1.dw_dT(0.0, T_mid):.5f} "
+          "(the Dupire numerator)")
+    # Dupire local volatility on the C1 surface: dw/dT over the density
+    # factor g(k). NaN (and counted) wherever the surface is butterfly-
+    # or calendar-arbitrageable -- never a negative variance.
+    lv, n_bad = c1.local_vol(K, T_mid, return_n_invalid=True)
+    print(f"local_vol(K, {T_mid:.3f}) = {np.round(lv, 4)} "
+          f"vs iv {np.round(c1.iv(K, T_mid), 4)}; invalid points: {n_bad}")
 
     # ── Direct construction ──────────────────────────────────────────
     # VolSurface is just (model, {maturity: params}) -- params from any

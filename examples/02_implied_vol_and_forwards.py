@@ -54,9 +54,9 @@ def main() -> None:
     df, meta = load_snapshot()
     spot = meta["spot"]
     r_flat = meta["r_13w_cc"]
-    r_curve = term_structure(meta)
+    curve = term_structure(meta)             # irm.DiscountCurve
     print(f"snapshot {meta['snapshot_utc']}  spot={spot:.2f}  "
-          f"r_flat={r_flat:.4%}  r(5y)={r_curve(5.0):.4%}")
+          f"r_flat={r_flat:.4%}  r(5y)={curve.zero_rate(5.0):.4%}")
 
     df["mid"] = 0.5 * (df["bid"] + df["ask"])
 
@@ -78,11 +78,15 @@ def main() -> None:
         call_mid=pd.Series(calls.loc[both].to_numpy()),
         put_mid=pd.Series(puts.loc[both].to_numpy()),
     )
-    # The rate argument also accepts a callable T -> r(T):
+    # The rate argument takes any rate view: an irm.DiscountCurve (as
+    # here), an interest-rate model from interest_rate_models, or any
+    # callable T -> r(T) -- e.g. a cubic spline over the curve pillars:
+    #     from scipy.interpolate import CubicSpline
+    #     r = CubicSpline(pillar_times, pillar_rates)
     fwd_curve = calculate_implied_forward(
         spot=pd.Series(np.full(n, spot)),
         tte=pd.Series(np.full(n, T0)),
-        r=r_curve,                               # term-structure callable
+        r=curve,                                 # the fitted curve itself
         strike=pd.Series(both.to_numpy()),
         call_mid=pd.Series(calls.loc[both].to_numpy()),
         put_mid=pd.Series(puts.loc[both].to_numpy()),
