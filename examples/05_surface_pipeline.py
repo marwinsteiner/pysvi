@@ -166,6 +166,12 @@ def main() -> None:
           f"monotone_cubic={c1.regularity}")
     print(f"dw_dT(ATM, T={T_mid:.3f}) = {c1.dw_dT(0.0, T_mid):.5f} "
           "(the Dupire numerator)")
+    # Dupire local volatility on the C1 surface: dw/dT over the density
+    # factor g(k). NaN (and counted) wherever the surface is butterfly-
+    # or calendar-arbitrageable -- never a negative variance.
+    lv, n_bad = c1.local_vol(K, T_mid, return_n_invalid=True)
+    print(f"local_vol(K, {T_mid:.3f}) = {np.round(lv, 4)} "
+          f"vs iv {np.round(c1.iv(K, T_mid), 4)}; invalid points: {n_bad}")
 
     # ── Direct construction ──────────────────────────────────────────
     # VolSurface is just (model, {maturity: params}) -- params from any

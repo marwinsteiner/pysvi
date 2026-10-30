@@ -11,6 +11,7 @@ The v1.2.0 layer, demonstrated on the real SPY snapshot:
   interpolated as a jump instead of smeared
 * MarketContext -- real expiry dates plus one coherent day-count and
   numeraire convention
+* smile dynamics -- sticky-strike vs sticky-delta hedge ratios
 * evaluation status and economic arbitrage classification -- is a
   number market information or model extrapolation, and is a violation
   a trade or an artifact
@@ -122,6 +123,18 @@ def main() -> None:
     iv, status = surface.iv(K, T0, return_status=True)
     for Ki, vi, st in zip(K, iv, status):
         print(f"iv(K={Ki:7.1f}, T={T0:.3f}) = {vi:.2%}  [{st}]")
+
+    # ── Smile dynamics: sticky strike vs sticky delta ────────────────
+    # Same surface, two hedge ratios (Derman 1999): if vols stay put per
+    # strike (range-bound) vs float with the forward (trending). The
+    # difference is -vega * (d sigma/dk) / F: higher wherever the smile
+    # slopes down (puts, ATM on an equity skew), lower where the call
+    # wing turns up.
+    K_atm = np.array([spot * 0.95, spot, spot * 1.05])
+    d_ss = surface.delta(K_atm, T0, sticky="strike")
+    d_sd = surface.delta(K_atm, T0, sticky="delta")
+    for Ki, a, b in zip(K_atm, d_ss, d_sd):
+        print(f"call delta K={Ki:7.1f}: sticky-strike {a:.3f}  sticky-delta {b:.3f}")
 
     # ── Economic arbitrage classification ────────────────────────────
     # The diagnostics report mathematical evidence; the classification

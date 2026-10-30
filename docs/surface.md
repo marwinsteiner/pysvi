@@ -65,6 +65,20 @@ surface.dw_dT(k, T)       # the Dupire numerator, any T in range
 
 `dw_dT` on a C0 surface raises rather than return a one-sided number that would be silently wrong at the knots. Smoothness in strike comes from the model itself and is analytic for the SVI family under every method.
 
+### Dupire local volatility
+
+On a C1 surface, `local_vol` assembles Dupire's formula in Gatheral's total-variance form:
+
+$$\sigma_{\mathrm{loc}}^2(k,T) = \frac{\partial_T w}{g(k)}, \qquad g(k) = 1 - \frac{k\,w'}{w} + \frac{1}{4}\left(-\frac{1}{4} - \frac{1}{w} + \frac{k^2}{w^2}\right) w'^2 + \frac{1}{2} w''$$
+
+```python
+surface = VolSurface.fit(df, model="svi", interp_method="monotone_cubic")
+surface.local_vol(K, T)                           # at absolute strikes
+lv, n_bad = surface.local_variance(k, T, return_n_invalid=True)
+```
+
+The denominator is exactly the risk-neutral density factor $g(k)$ of the butterfly diagnostics, so local variance exists precisely where the slice is butterfly-free; a negative numerator is a calendar violation. Both regions return NaN — never a negative or imaginary variance — and `return_n_invalid=True` reports how many points were affected. C0 surfaces raise. With variance events, the numerator is the continuous component's $\partial_T w$ (an event is a jump, not a rate). Wings beyond the quoted strikes inherit the model's extrapolation — pair with `iv(..., return_status=True)`.
+
 ## Evaluation
 
 ```python
@@ -140,6 +154,25 @@ surface.vega(K, T)               # per unit volatility
 surface.theta(K, T, cp="call")   # per year of calendar time
 ```
 
-Conventions: Greeks hold the implied volatility fixed (sticky-strike); delta and gamma are with respect to the forward; vega is per 1.00 of volatility; theta is annualized. Prices are verified against `py_vollib` and the Greeks against finite differences of the Black price in the test suite.
+Conventions: delta and gamma are with respect to the forward; vega is per 1.00 of volatility; theta is annualized. Prices are verified against `py_vollib` and the Greeks against finite differences of the price in the test suite.
+
+### Smile dynamics: sticky strike vs sticky delta
+
+How implied vols move when the underlying moves is a modelling choice, and it changes the hedge ratio. Derman (1999, "Regimes of Volatility", Goldman Sachs Quantitative Strategies Research Notes) observed S&P 500 implied vols following three distinct rules depending on the market regime:
+
+| regime | rule | typical market | delta vs sticky strike |
+|---|---|---|---|
+| sticky strike | $\sigma(K)$ fixed as the forward moves | range-bound | — (Black-Scholes delta) |
+| sticky delta / moneyness | $\sigma(\log K/F)$ fixed; the smile floats with the forward | trending | higher (negative skew) |
+| sticky implied tree | local-vol surface fixed | jumpy, post-crash | lower |
+
+`delta` and `gamma` take `sticky="strike"` (default, unchanged behaviour) or `sticky="delta"`:
+
+```python
+surface.delta(K, T, cp="call", sticky="delta")
+surface.gamma(K, T, sticky="delta")
+```
+
+Under sticky delta the smile slope enters the hedge ratio, $\Delta_{\mathrm{sd}} = \Delta_{\mathrm{ss}} - \mathcal{V}\,\sigma_k / F$, and gamma picks up the matching vanna, volga and vega terms (with $\sigma_k, \sigma_{kk}$ from the model's analytic $w', w''$). `price` and `vega` are convention-independent; `theta` holds the forward fixed, where strike and moneyness coincide, so both conventions agree. The third regime is reserved as `sticky="local_vol"` and not implemented yet; the local-vol surface it needs is `local_vol` above.
 
 Deliberately out of scope here: American exercise, exotics, rate sensitivity, curve-aware discounting (curves are a later release; `r` is flat), and extrapolation beyond the fitted maturity range.
