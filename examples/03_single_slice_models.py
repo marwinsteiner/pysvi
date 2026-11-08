@@ -177,6 +177,23 @@ def main() -> None:
           f"lee_free={report.lee_free})")
     print(report)
 
+    # ── Identifiability: is each PARAMETER, not just the fit, trusted?
+    # Near-identical smiles arise from very different SVI parameters, so
+    # a signal built on parameter changes can be optimizer noise. The
+    # report gives Gauss-Newton standard errors, correlations, and a
+    # condition number; thresholds are tunable. On this real slice the
+    # smile fits to tens of basis points, yet several parameter pairs
+    # come out near-degenerate (the quoted range is one-sided) -- which
+    # is exactly the lesson: a great fit does not make the individual
+    # parameters trustworthy inputs to a signal.
+    from pysvi import identifiability_report
+    from pysvi.calibration import prepare_slice
+
+    k_arr, w_arr, _ = prepare_slice(df_slice)
+    print()
+    print(identifiability_report(model, p, k_arr, w_arr,
+                                 rel_threshold=0.5, corr_threshold=0.95))
+
 
 if __name__ == "__main__":
     main()

@@ -28,10 +28,12 @@ Rates are a real curve, not a constant: script 01 fits a four-pillar
 Treasury zero curve (13w/5y/10y/30y) with
 [interest-rate-models](https://pypi.org/project/interest-rate-models/)
 (`import interest_rate_models as irm`; `irm.DiscountCurve`) and
-persists it densely in the snapshot metadata. Neither yfinance nor
-interest-rate-models is a dependency of `svi-py` -- the calibration
-API takes a plain callable `T -> r(T)`, and the offline scripts
-reconstruct it from the file with numpy alone.
+persists it densely in the snapshot metadata; the offline scripts
+rebuild the same `irm.DiscountCurve` from the file.
+interest-rate-models is a core dependency of `svi-py` -- rate inputs
+accept its curves and models directly, alongside flat floats and any
+callable `T -> r(T)` such as a cubic spline; yfinance stays
+examples-only.
 
 ## No lookahead
 
