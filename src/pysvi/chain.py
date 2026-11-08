@@ -95,6 +95,7 @@ class OptionChain:
         rate: RateLike = 0.0,
         dividend_yield: RateLike = 0.0,
         mode: str = "warn",
+        context=None,
     ) -> "OptionChain":
         """Ingest raw call/put quotes into a calibration-ready chain.
 
@@ -112,8 +113,10 @@ class OptionChain:
         df : pd.DataFrame
             Raw quotes; one row per option.
         strike, expiry, cp, bid, ask : str
-            Column names. ``expiry`` is a year fraction; ``cp`` accepts
-            'c'/'call'/'p'/'put' (case-insensitive).
+            Column names. ``expiry`` is a year fraction -- or, with
+            ``context=``, real expiry dates resolved through the
+            context's day count; ``cp`` accepts 'c'/'call'/'p'/'put'
+            (case-insensitive).
         spot : float, optional
             Underlying spot, used only for the forward fallback.
         rate : float, curve, model, or callable, default 0.0
@@ -125,6 +128,12 @@ class OptionChain:
         dividend_yield : float, curve, model, or callable, default 0.0
             Continuous dividend yield for the forward fallback only
             (put-call-parity forwards embed dividends already).
+        context : MarketContext, optional
+            Single source of numeraire and time conventions
+            (:class:`pysvi.context.MarketContext`): supplies spot,
+            rate, dividend view and the day count that turns expiry
+            dates into year fractions. Mutually exclusive with the
+            separate spot/rate/dividend_yield arguments.
         mode : str, default "warn"
             Failure handling. ``"strict"``: the first bad input raises
             with its location (invalid quote rows, an expiry that
@@ -141,9 +150,31 @@ class OptionChain:
         OptionChain
         """
         validate_mode(mode)
+        if context is not None:
+            # One source of numeraire truth: mixing a MarketContext
+            # with separately supplied conventions is loudly rejected.
+            if spot is not None or rate != 0.0 or dividend_yield != 0.0:
+                raise ValueError(
+                    "OptionChain: pass EITHER context= OR "
+                    "spot/rate/dividend_yield -- mixing a MarketContext "
+                    "with separate numeraire inputs is not coherent"
+                )
+            spot = context.spot
+            rate = context.rate
+            dividend_yield = context.dividend_yield
+            maturity_col = pd.to_numeric(df[expiry], errors="coerce")
+            if maturity_col.isna().any():
+                # expiry column holds DATES: resolve through the
+                # context's day count from its valuation time
+                maturity_col = pd.Series(
+                    context.year_fraction(pd.to_datetime(df[expiry])),
+                    index=df.index,
+                )
+        else:
+            maturity_col = pd.to_numeric(df[expiry], errors="coerce")
         data = pd.DataFrame({
             "strike": pd.to_numeric(df[strike], errors="coerce"),
-            "maturity": pd.to_numeric(df[expiry], errors="coerce"),
+            "maturity": maturity_col,
             "cp": df[cp].astype(str).str.lower().str[0],
             "bid": pd.to_numeric(df[bid], errors="coerce"),
             "ask": pd.to_numeric(df[ask], errors="coerce"),

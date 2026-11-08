@@ -80,6 +80,29 @@ surface.params(T)             # per-slice parameter dict
 
 All strike/moneyness inputs are vectorized; scalar in, scalar out. Any maturity inside the fitted range works (see Interpolation below); maturities outside it raise.
 
+## Variance events
+
+Real term structures contain known jumps — earnings, FOMC, CPI, elections. Generic maturity interpolation smooths across them, silently asserting all term-structure curvature is continuous variance. `VarianceEvent(time, variance, label)` makes the jump explicit:
+
+```python
+from pysvi import VarianceEvent, implied_event_variances
+
+surface = VolSurface.fit(df, events=[VarianceEvent(0.4, 0.006, "earnings")])
+```
+
+Total variance decomposes as $w(k,T) = w_{cont}(k,T) + \sum_{t_e \le T} v_e$: fitting subtracts each expiry's cumulative event variance (slices store the **continuous** component; events inconsistent with the quoted variance are rejected), interpolation acts on the continuous component, and evaluation adds the events back on the correct side of each event time — so the surface reproduces the jump exactly instead of smearing it, and the calendar diagnostics raise no false violation across an event. Events serialize with the surface; `dw_dT` reports the continuous derivative (the jump is a jump). `implied_event_variances(df, events)` reports the quoted ATM-variance jump straddling each event as an upper bound on its variance.
+
+## Evaluation status
+
+Every slice records its quoted strike range on the fit report, and evaluation can say whether a number is market information or model wing:
+
+```python
+iv, status = surface.iv(K, T, return_status=True)
+# status per point: "observed" | "interpolated" | "extrapolated"
+```
+
+`"observed"` means a fitted maturity inside that slice's quoted range; `"interpolated"` sits between fitted maturities inside the bracketing slices' joint quoted range; everything else is `"extrapolated"` — the model's wings, not the market. See also the economic arbitrage classification on the {doc}`arbitrage <arbitrage>` page.
+
 ## Fit reports and diagnostics
 
 A surface is the output of a calibration process, and the process carries the evidence needed to trust the output. `fit` records that evidence on the surface:

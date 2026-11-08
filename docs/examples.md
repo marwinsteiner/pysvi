@@ -15,6 +15,7 @@ of the library surface.
 | [`03_single_slice_models.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/03_single_slice_models.py) | All seven parametrizations, `apply_slice`, the module-level total-variance functions, the raw/natural bijection, derivatives/density/wing slopes, `check_slice_arbitrage` |
 | [`04_calibration_controls.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/04_calibration_controls.py) | Every `objective`, `loss`, `f_scale`, `initialization`; `ArbitrageFreedom` flags; the numba toggles |
 | [`05_surface_pipeline.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/05_surface_pipeline.py) | `OptionChain`, `calibrate_surface`, `VolSurface` evaluation and interpolation, `diagnose`, Black-76 Greeks, `save`/`load` |
+| [`06_trading_workflows.py`](https://github.com/marwinsteiner/pysvi/blob/main/examples/06_trading_workflows.py) | Prior-anchored recalibration, quote-to-surface Jacobians, variance events, `MarketContext` (dates and day counts), evaluation status, economic arbitrage classification |
 
 Only script 01 needs the network; a committed sample snapshot lets
 02–05 run immediately:
