@@ -33,6 +33,17 @@ params = calibrate_slice(
 - `"jump_wings"` (SVI and NaturalSVI) — a data-driven start read off the quotes: wing slopes from the outer 20% of strikes on each side, skew from their asymmetry, vertex from the minimum-variance strike.
 - `"multi_start"` — a deterministic grid of starts (the default start plus skew and width variations, 16 total); each runs L-BFGS-B to tight tolerance and the result with the lowest objective value wins. The default start is additionally run under the default path's own settings, so `multi_start` can never return a worse fit than `default` with the same controls. Raw SVI's landscape has genuine bad basins that a single start can fall into — multi-start is the recommended setting whenever fit quality matters more than the last millisecond, and it is cheap under the numba backend.
 
+### Temporal stability: prior-anchored fits
+
+Two nearly identical markets can produce materially different parameters — the optimizer lands in an equivalent basin, and raw SVI coordinates are not equally meaningful. Every iterative model (and the surface fitters) accepts:
+
+```python
+params_today = model.calibrate(k, w, prior=params_yesterday, anchor=1.0)
+surface_today = VolSurface.fit(df, prior=surface_yesterday, anchor=1.0)
+```
+
+`prior` warm-starts from yesterday's parameters (with `multi_start` it becomes the base start of the grid); `anchor > 0` adds a Tikhonov pull `anchor * mean((w(k) - w_prior(k))^2)` on the penalty grid — anchoring the **surface shape**, not the raw parameters, so near-degenerate parameter directions are not pinned arbitrarily. `anchor=0` (the default) leaves the objective untouched, and identical quotes plus an identical prior give identical parameters.
+
 When any control is active the optimizer runs with tight tolerances (`ftol=1e-15`); the plain default path keeps scipy's defaults for backward-compatible fits.
 
 ## Failure semantics: strict / warn / lenient
