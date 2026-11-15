@@ -13,6 +13,7 @@ documentation of the library surface.
 | `03_single_slice_models.py` | All 7 parametrizations via `get_model`/`calibrate_slice`/`apply_slice`, the module-level `*_total_variance` functions, `natural_to_raw`/`raw_to_natural`, `derivatives`/`dw_dk`/`d2w_dk2`/`density`/`wing_slopes`/`fd_step`, `check_slice_arbitrage`, `identifiability_report` |
 | `04_calibration_controls.py` | Every `objective` (incl. `bid_ask`), every `loss`, `f_scale`, every `initialization`, `ArbitrageFreedom` flags, `use_numba`/`numba_available`/`PYSVI_NUMBA`, `warm_up`, the `backend` context |
 | `05_surface_pipeline.py` | `OptionChain.from_dataframe` (all parameters incl. `mode`), `chain.fit`, `calibrate_surface`, `VolSurface.fit` + direct construction, all evaluation methods, maturity interpolation (`total_variance`/`theta`/`monotone_cubic`), `regularity`/`dw_dT`, `diagnose`/`check_arbitrage`, all Black-76 Greeks, `save`/`load` |
+| `06_trading_workflows.py` | Prior-anchored recalibration (`prior`/`anchor`), quote-to-surface Jacobians (`quote_sensitivity`/`iv_surface_sensitivity`), `VarianceEvent` + `implied_event_variances`, `MarketContext` (dates, day counts, coherent numeraire), `iv(..., return_status=True)`, `classify_arbitrage` |
 
 ## Running
 
@@ -24,6 +25,7 @@ uv run examples/02_implied_vol_and_forwards.py
 uv run examples/03_single_slice_models.py
 uv run examples/04_calibration_controls.py
 uv run examples/05_surface_pipeline.py
+uv run examples/06_trading_workflows.py
 ```
 
 (Outside this repo: `pip install svi-py yfinance` and run with plain

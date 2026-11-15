@@ -41,6 +41,13 @@
    :show-inheritance:
 ```
 
+## Market context
+
+```{eval-rst}
+.. automodule:: pysvi.context
+   :members:
+```
+
 ## Identifiability
 
 ```{eval-rst}

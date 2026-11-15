@@ -33,6 +33,7 @@ from .models import Parametrization
 __all__ = [
     "condition_number", "parameter_uncertainty", "identifiability_report",
     "ParameterUncertainty", "IdentifiabilityReport",
+    "quote_sensitivity", "surface_sensitivity", "iv_surface_sensitivity",
 ]
 
 
@@ -257,3 +258,72 @@ def identifiability_report(
         rel_threshold=rel_threshold,
         corr_threshold=corr_threshold,
     )
+
+
+# ── Quote-to-surface sensitivities (issue #28) ───────────────────────
+
+def quote_sensitivity(
+    model: Parametrization,
+    params: Dict[str, float],
+    k: NDArray[np.float64],
+    w_target: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Sensitivity of the fitted parameters to each quote, dtheta/dw_i.
+
+    Implicit-function Jacobian at the least-squares optimum: with
+    J = dw_model/dtheta at the quotes, a perturbation dw of the quote
+    vector moves the optimum by ``dtheta = (J^T J)^+ J^T dw`` -- the
+    Gauss-Newton system that already powers the uncertainty reports.
+    Returns the p x n matrix whose column i answers "if quote i's total
+    variance moves by 1, where do the parameters go".
+
+    Valid to first order at a (local) optimum of the unpenalized
+    least-squares objective; arbitrage penalties active at the optimum
+    shift the picture only when they bind.
+    """
+    k = np.asarray(k, dtype=np.float64)
+    J = model.param_jacobian(k, params)
+    return np.linalg.pinv(J.T @ J) @ J.T
+
+
+def surface_sensitivity(
+    model: Parametrization,
+    params: Dict[str, float],
+    k: NDArray[np.float64],
+    w_target: NDArray[np.float64],
+    k_eval: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Quote-to-surface Jacobian: dw(k_eval) / dw(quote_i), m x n.
+
+    Chains :func:`quote_sensitivity` through the model's parameter
+    Jacobian at the evaluation points: row j says how the fitted total
+    variance at ``k_eval[j]`` responds to a unit move in each quote's
+    total variance. The core of hedging, P&L explain and scenario
+    analysis: bump one quote, read the whole smile's response without
+    recalibrating.
+    """
+    k_eval = np.asarray(k_eval, dtype=np.float64)
+    J_eval = model.param_jacobian(k_eval, params)
+    return J_eval @ quote_sensitivity(model, params, k, w_target)
+
+
+def iv_surface_sensitivity(
+    model: Parametrization,
+    params: Dict[str, float],
+    k: NDArray[np.float64],
+    w_target: NDArray[np.float64],
+    k_eval: NDArray[np.float64],
+    T: float,
+) -> NDArray[np.float64]:
+    """:func:`surface_sensitivity` in implied-vol units on both sides.
+
+    Entry (j, i) is div(k_eval_j)/div(quote_i): with w = iv^2 T on both
+    sides, the w-space Jacobian is scaled by ``2 iv_i T`` per quote
+    column and ``1 / (2 iv_j T)`` per evaluation row. The natural view
+    for "this quote moves 1 vol point -- what does the smile do".
+    """
+    S = surface_sensitivity(model, params, k, w_target, k_eval)
+    iv_q = np.sqrt(np.maximum(np.asarray(w_target, dtype=np.float64), 1e-16) / T)
+    w_eval = model.total_variance(np.asarray(k_eval, dtype=np.float64), params)
+    iv_e = np.sqrt(np.maximum(w_eval, 1e-16) / T)
+    return (S * (2.0 * iv_q * T)[None, :]) / (2.0 * iv_e * T)[:, None]
